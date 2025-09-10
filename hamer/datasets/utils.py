@@ -81,7 +81,7 @@ def rotate_2d(pt_2d: np.array, rot_rad: float) -> np.array:
 def gen_trans_from_patch_cv(c_x: float, c_y: float,
                             src_width: float, src_height: float,
                             dst_width: float, dst_height: float,
-                            scale: float, rot: float) -> np.array:
+                            scale: float, rot: float,inv:bool=False) -> np.array:
     """
     Create transformation matrix for the bounding box crop.
     Args:
@@ -123,7 +123,11 @@ def gen_trans_from_patch_cv(c_x: float, c_y: float,
     dst[1, :] = dst_center + dst_downdir
     dst[2, :] = dst_center + dst_rightdir
 
-    trans = cv2.getAffineTransform(np.float32(src), np.float32(dst))
+    if not inv:
+        trans = cv2.getAffineTransform(np.float32(src), np.float32(dst))
+    else:
+        trans = cv2.getAffineTransform(np.float32(dst), np.float32(src))
+    
 
     return trans
 
@@ -318,7 +322,7 @@ def generate_image_patch_cv2(img: np.array, c_x: float, c_y: float,
                              bb_width: float, bb_height: float,
                              patch_width: float, patch_height: float,
                              do_flip: bool, scale: float, rot: float,
-                             border_mode=cv2.BORDER_CONSTANT, border_value=0) -> Tuple[np.array, np.array]:
+                             border_mode=cv2.BORDER_CONSTANT, border_value=0) -> Tuple[np.array, np.array, np.array]:
     """
     Crop the input image and return the crop and the corresponding transformation matrix.
     Args:
@@ -335,6 +339,7 @@ def generate_image_patch_cv2(img: np.array, c_x: float, c_y: float,
     Returns:
         img_patch (np.array): Cropped image patch of shape (patch_height, patch_height, 3)
         trans (np.array): Transformation matrix.
+        inv_trans (np.array): Inverse transformation matrix.
     """
 
     img_height, img_width, img_channels = img.shape
@@ -344,6 +349,7 @@ def generate_image_patch_cv2(img: np.array, c_x: float, c_y: float,
 
 
     trans = gen_trans_from_patch_cv(c_x, c_y, bb_width, bb_height, patch_width, patch_height, scale, rot)
+    inv_trans = gen_trans_from_patch_cv(c_x, c_y, bb_width, bb_height, patch_width, patch_height, scale, rot, inv=True)
 
     img_patch = cv2.warpAffine(img, trans, (int(patch_width), int(patch_height)), 
                         flags=cv2.INTER_LINEAR, 
@@ -357,7 +363,7 @@ def generate_image_patch_cv2(img: np.array, c_x: float, c_y: float,
                                             borderMode=cv2.BORDER_CONSTANT,
                             )
 
-    return img_patch, trans
+    return img_patch, trans, inv_trans
 
 
 def convert_cvimg_to_tensor(cvimg: np.array):

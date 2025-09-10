@@ -31,9 +31,9 @@ class HAMER(pl.LightningModule):
         self.cfg = cfg
         # Create backbone feature extractor
         self.backbone = create_backbone(cfg)
-        if cfg.MODEL.BACKBONE.get('PRETRAINED_WEIGHTS', None):
-            log.info(f'Loading backbone weights from {cfg.MODEL.BACKBONE.PRETRAINED_WEIGHTS}')
-            self.backbone.load_state_dict(torch.load(cfg.MODEL.BACKBONE.PRETRAINED_WEIGHTS, map_location='cpu')['state_dict'])
+        # if cfg.MODEL.BACKBONE.get('PRETRAINED_WEIGHTS', None):
+        #     log.info(f'Loading backbone weights from {cfg.MODEL.BACKBONE.PRETRAINED_WEIGHTS}')
+        #     self.backbone.load_state_dict(torch.load(cfg.MODEL.BACKBONE.PRETRAINED_WEIGHTS, map_location='cpu')['state_dict'])
 
         # Create MANO head
         self.mano_head = build_mano_head(cfg)
@@ -49,7 +49,8 @@ class HAMER(pl.LightningModule):
 
         # Instantiate MANO model
         mano_cfg = {k.lower(): v for k,v in dict(cfg.MANO).items()}
-        self.mano = MANO(**mano_cfg)
+        self.mano = MANO(pose2rot=False, **mano_cfg)
+        print(self.mano)
 
         # Buffer that shows whetheer we need to initialize ActNorm layers
         self.register_buffer('initialized', torch.tensor(False))
@@ -137,6 +138,18 @@ class HAMER(pl.LightningModule):
                                                    focal_length=focal_length / self.cfg.MODEL.IMAGE_SIZE)
 
         output['pred_keypoints_2d'] = pred_keypoints_2d.reshape(batch_size, -1, 2)
+        
+        output['pred_mano_params'] = pred_mano_params
+        mano_param = []
+        for i in range(len(output['pred_mano_params']['global_orient'])):
+            tmp = {}
+            tmp['global_orient'] = output['pred_mano_params']['global_orient'][i].detach().cpu().numpy()
+            tmp['hand_pose'] = output['pred_mano_params']['hand_pose'][i].detach().cpu().numpy()
+            tmp['betas'] = output['pred_mano_params']['betas'][i].detach().cpu().numpy()
+            mano_param.append(tmp)
+        output['pred_mano_params'] = mano_param
+
+        
         return output
 
     def compute_loss(self, batch: Dict, output: Dict, train: bool = True) -> torch.Tensor:

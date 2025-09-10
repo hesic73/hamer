@@ -10,21 +10,23 @@ from mmpose.apis import inference_top_down_pose_model, init_pose_model, process_
 
 os.environ["PYOPENGL_PLATFORM"] = "egl"
 
-# project root directory
-ROOT_DIR = "./"
-VIT_DIR = os.path.join(ROOT_DIR, "third-party/ViTPose")
 
 class ViTPoseModel(object):
-    MODEL_DICT = {
-        'ViTPose+-G (multi-task train, COCO)': {
-            'config': f'{VIT_DIR}/configs/wholebody/2d_kpt_sview_rgb_img/topdown_heatmap/coco-wholebody/ViTPose_huge_wholebody_256x192.py',
-            'model': f'{ROOT_DIR}/_DATA/vitpose_ckpts/vitpose+_huge/wholebody.pth',
-        },
-    }
 
-    def __init__(self, device: str | torch.device):
+    def __init__(
+        self,
+        vitpose_dir: str,
+        data_dir: str,
+        device: torch.device,
+    ):
         self.device = torch.device(device)
         self.model_name = 'ViTPose+-G (multi-task train, COCO)'
+        self.MODEL_DICT = {
+            'ViTPose+-G (multi-task train, COCO)': {
+                'config': f'{vitpose_dir}/configs/wholebody/2d_kpt_sview_rgb_img/topdown_heatmap/coco-wholebody/ViTPose_huge_wholebody_256x192.py',
+                'model': f'{data_dir}/vitpose_ckpts/vitpose+_huge/wholebody.pth',
+            },
+        }
         self.model = self._load_model(self.model_name)
 
     def _load_all_models_once(self) -> None:
