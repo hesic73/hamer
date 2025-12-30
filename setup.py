@@ -16,12 +16,10 @@ setup(
         'torch',
         'torchvision',
         'yacs',
-        'detectron2 @ git+https://github.com/facebookresearch/detectron2',
-        'chumpy @ git+https://github.com/mattloper/chumpy',
+        # 'detectron2 @ git+https://github.com/facebookresearch/detectron2',  # Install separately
         'mmcv==1.3.9',
         'timm',
         'einops',
-        'xtcocotools',
         'pandas',
     ],
     extras_require={
