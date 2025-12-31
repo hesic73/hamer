@@ -1,28 +1,20 @@
 from typing import List, Tuple
 import math
-from matplotlib import cm
-import matplotlib.pyplot as plt
 from tqdm import tqdm
 from typing import Dict, Optional
 import json
-from mediapipe.tasks.python import vision
-from mediapipe.tasks import python
 import mediapipe as mp
-from mediapipe.framework.formats import landmark_pb2
-from mediapipe import solutions
 from vitpose_model import ViTPoseModel
 from pathlib import Path
 import torch
 import argparse
 import os
-import sys
 import cv2
 import numpy as np
 import pickle
 
 from hamer.models import HAMER, download_models, load_hamer
 from hamer.utils import recursive_to
-from hamer.utils.geometry import aa_to_rotmat, perspective_projection
 from hamer.datasets.vitdet_dataset import ViTDetDataset, DEFAULT_MEAN, DEFAULT_STD
 from hamer.utils.renderer import Renderer, cam_crop_to_full
 import time
@@ -36,15 +28,22 @@ FONT_THICKNESS = 1
 MARGIN = 10  # pixels
 HANDEDNESS_TEXT_COLOR = (205, 54, 88)
 
-# 2D keypoints detection
+# 2D keypoints detection - New MediaPipe Tasks API
+from mediapipe.tasks import python as mp_tasks
+from mediapipe.tasks.python import vision as mp_vision
 
-mp_hands = mp.solutions.hands
-mp_drawing = mp.solutions.drawing_utils          # mediapipe 繪圖方法
-mp_drawing_styles = mp.solutions.drawing_styles  # mediapipe 繪圖樣式
-# Get the default hand landmarks style
-landmark_style = mp.solutions.drawing_styles.get_default_hand_landmarks_style()
-for i in landmark_style.keys():
-    landmark_style[i].circle_radius = 1
+# Hand connections for drawing (same as legacy HAND_CONNECTIONS)
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),  # Thumb
+    (0, 5), (5, 6), (6, 7), (7, 8),  # Index
+    (0, 9), (9, 10), (10, 11), (11, 12),  # Middle
+    (0, 13), (13, 14), (14, 15), (15, 16),  # Ring
+    (0, 17), (17, 18), (18, 19), (19, 20),  # Pinky
+    (5, 9), (9, 13), (13, 17)  # Palm
+]
+
+# Path to the hand landmarker model
+HAND_LANDMARKER_MODEL_PATH = os.path.join(os.path.dirname(__file__), 'models', 'hand_landmarker.task')
 
 openpose_indices = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
                     10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
@@ -112,62 +111,72 @@ def restrict_hand_movement(bboxes, right, vit_keypoints):
     return np.array(new_bboxes), np.array(new_right), np.array(new_vit_keypoints)
 
 
+def draw_hand_landmarks_on_image(vis, landmarks, h, w):
+    """Draw hand landmarks on the visualization image."""
+    # Draw connections
+    for connection in HAND_CONNECTIONS:
+        start_idx, end_idx = connection
+        start_point = (int(landmarks[start_idx][0]), int(landmarks[start_idx][1]))
+        end_point = (int(landmarks[end_idx][0]), int(landmarks[end_idx][1]))
+        cv2.line(vis, start_point, end_point, (0, 255, 0), 1)
+    
+    # Draw landmarks
+    for lm in landmarks:
+        cv2.circle(vis, (int(lm[0]), int(lm[1])), 1, (0, 0, 255), -1)
+    return vis
+
+
 def run_mediapipe(img, vis):
-    # mediapipe 啟用偵測手掌
-    with mp_hands.Hands(
-        model_complexity=1,
-        # max_num_hands=1,
-        min_detection_confidence=conf_thld_0,
-            min_tracking_confidence=conf_thld_0) as hands:
-
-        img.flags.writeable = False
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        results = hands.process(img)
-
-        # Draw the hand annotations on the image.
-        img.flags.writeable = True
-        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-
-        # print('running old mediapipe v1!')
+    # MediaPipe Tasks API for hand detection
+    base_options = mp_tasks.BaseOptions(model_asset_path=HAND_LANDMARKER_MODEL_PATH)
+    options = mp_vision.HandLandmarkerOptions(
+        base_options=base_options,
+        running_mode=mp_vision.RunningMode.IMAGE,
+        num_hands=2,
+        min_hand_detection_confidence=max(0.5, conf_thld_0),  # Tasks API requires >= 0
+        min_tracking_confidence=max(0.5, conf_thld_0)
+    )
+    
+    with mp_vision.HandLandmarker.create_from_options(options) as landmarker:
+        # Convert BGR to RGB
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_rgb)
+        
+        # Detect hand landmarks
+        results = landmarker.detect(mp_image)
+        
+        h, w, c = img.shape
         left_hand = None
         right_hand = None
-        # print('*******')
-        if results.multi_hand_landmarks:
-            for hand_landmarks, classification in zip(results.multi_hand_landmarks, results.multi_handedness):
-                handedness = classification.classification[0].label
-
+        
+        if results.hand_landmarks:
+            for hand_landmarks, handedness_list in zip(results.hand_landmarks, results.handedness):
+                handedness = handedness_list[0].category_name
+                
                 lmList = []
-                # confidences = [landmark.presence for landmark in hand_landmarks.landmark]
-                for _, lm in enumerate(hand_landmarks.landmark):
-                    if lm.visibility != 0:
-                        raise ValueError
-                    h, w, c = img.shape
+                for lm in hand_landmarks:
                     px, py = int(lm.x * w), int(lm.y * h)
-                    # lmList.append([px, py, lm.presence])
                     lmList.append([px, py, 1])
-
-                # vis
-                mp_drawing.draw_landmarks(
-                    vis,
-                    hand_landmarks,
-                    mp_hands.HAND_CONNECTIONS,
-                    landmark_style,
-                    mp_drawing_styles.get_default_hand_connections_style())
-
+                
+                lmList_np = np.array(lmList)
+                
+                # Draw landmarks on vis
+                vis = draw_hand_landmarks_on_image(vis, lmList_np, h, w)
+                
+                # Note: MediaPipe returns handedness from the camera's perspective (mirrored)
                 if handedness == 'Left':
                     cv2.putText(vis, f"Right",
                                 (0, 40), cv2.FONT_HERSHEY_DUPLEX,
                                 FONT_SIZE, HANDEDNESS_TEXT_COLOR, FONT_THICKNESS, cv2.LINE_AA)
-                    right_hand = np.array(lmList)
-
+                    right_hand = lmList_np
                 elif handedness == 'Right':
                     cv2.putText(vis, f"Left",
                                 (0, 80), cv2.FONT_HERSHEY_DUPLEX,
                                 FONT_SIZE, HANDEDNESS_TEXT_COLOR, FONT_THICKNESS, cv2.LINE_AA)
-                    left_hand = np.array(lmList)
+                    left_hand = lmList_np
                 else:
-                    raise ValueError
-
+                    raise ValueError(f"Unknown handedness: {handedness}")
+        
         return left_hand, right_hand, vis
 
 
