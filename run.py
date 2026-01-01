@@ -1,1052 +1,1343 @@
-from typing import List, Tuple
-import math
-from tqdm import tqdm
-from typing import Dict, Optional
-import json
-import mediapipe as mp
-from vitpose_model import ViTPoseModel
+"""
+Improved HaMeR pipeline with 3-pass architecture using YOLO hand detector:
+Pass 1: Extract all raw bboxes (YOLO → Hand bboxes directly)
+Pass 2: Clean bbox sequences globally (detect anomalies, smooth, interpolate)
+Pass 3: Run HaMeR on cleaned bboxes
+
+This uses YOLO hand detector (like WiLoR) instead of Detectron2 + ViTPose.
+"""
+
 from pathlib import Path
 import torch
 import argparse
 import os
+import sys
 import cv2
 import numpy as np
 import pickle
-
+from typing import Dict, List, Tuple, Optional
+from tqdm import tqdm
+import json
+import time
+import imageio
+from hamer.configs import CACHE_DIR_HAMER
 from hamer.models import HAMER, download_models, load_hamer
 from hamer.utils import recursive_to
-from hamer.datasets.vitdet_dataset import ViTDetDataset, DEFAULT_MEAN, DEFAULT_STD
+from hamer.utils.geometry import aa_to_rotmat, perspective_projection
+from hamer.datasets.vitdet_dataset_ours import ViTDetDataset, DEFAULT_MEAN, DEFAULT_STD
 from hamer.utils.renderer import Renderer, cam_crop_to_full
-import time
+from ultralytics import YOLO
+import hamer
 
-conf_thld_0 = 0.0
-conf_thld_1 = 0.0
-conf_thld_2 = 0.0
-LIGHT_BLUE = (0.65098039,  0.74117647,  0.85882353)
-FONT_SIZE = 3
-FONT_THICKNESS = 1
-MARGIN = 10  # pixels
-HANDEDNESS_TEXT_COLOR = (205, 54, 88)
+LIGHT_BLUE = (0.65098039, 0.74117647, 0.85882353)
 
-# 2D keypoints detection - New MediaPipe Tasks API
-from mediapipe.tasks import python as mp_tasks
-from mediapipe.tasks.python import vision as mp_vision
-
-# Hand connections for drawing (same as legacy HAND_CONNECTIONS)
-HAND_CONNECTIONS = [
-    (0, 1), (1, 2), (2, 3), (3, 4),  # Thumb
-    (0, 5), (5, 6), (6, 7), (7, 8),  # Index
-    (0, 9), (9, 10), (10, 11), (11, 12),  # Middle
-    (0, 13), (13, 14), (14, 15), (15, 16),  # Ring
-    (0, 17), (17, 18), (18, 19), (19, 20),  # Pinky
-    (5, 9), (9, 13), (13, 17)  # Palm
-]
-
-# Path to the hand landmarker model
-HAND_LANDMARKER_MODEL_PATH = os.path.join(os.path.dirname(__file__), 'models', 'hand_landmarker.task')
-
-openpose_indices = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
-                    10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+openpose_indices = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
 gt_indices = openpose_indices
 
 
-hand_history = {"left": None, "right": None}
-MAX_MOVEMENT = 30  # Maximum allowed pixel movement for hands between frames
-
-
-def restrict_hand_movement(bboxes, right, vit_keypoints):
-    global hand_history
-
-    if len(bboxes) == 1:
-        # Only one hand detected, update history accordingly
-        if right[0] == 0:
-            hand_history["left"] = (bboxes[0], vit_keypoints[0])
-        else:
-            hand_history["right"] = (bboxes[0], vit_keypoints[0])
-        return bboxes, right, vit_keypoints
-
-    # Two hands detected
-    left_hand, right_hand = None, None
-    left_hand_kp, right_hand_kp = None, None
-
-    for i in range(2):
-        if right[i] == 0:
-            left_hand, left_hand_kp = bboxes[i], vit_keypoints[i]
-        else:
-            right_hand, right_hand_kp = bboxes[i], vit_keypoints[i]
-
-    if hand_history["left"] is not None and left_hand is not None:
-        prev_left_bbox, prev_left_kp = hand_history["left"]
-        movement = np.linalg.norm(prev_left_bbox[:2] - left_hand[:2])
-        if movement > MAX_MOVEMENT:
-            left_hand, left_hand_kp = prev_left_bbox, prev_left_kp  # Use last frame's data
-
-    if hand_history["right"] is not None and right_hand is not None:
-        prev_right_bbox, prev_right_kp = hand_history["right"]
-        movement = np.linalg.norm(prev_right_bbox[:2] - right_hand[:2])
-        if movement > MAX_MOVEMENT:
-            right_hand, right_hand_kp = prev_right_bbox, prev_right_kp  # Use last frame's data
-
-    # Ensure left hand is in front
-    if left_hand is not None and right_hand is not None:
-        if left_hand[2] < right_hand[2]:  # Compare depths
-            left_hand, right_hand = right_hand, left_hand
-            left_hand_kp, right_hand_kp = right_hand_kp, left_hand_kp
-
-    # Update history
-    hand_history["left"] = (left_hand, left_hand_kp)
-    hand_history["right"] = (right_hand, right_hand_kp)
-
-    # Rebuild final lists with filtered results
-    new_bboxes, new_right, new_vit_keypoints = [], [], []
-    if left_hand is not None:
-        new_bboxes.append(left_hand)
-        new_right.append(0)
-        new_vit_keypoints.append(left_hand_kp)
-    if right_hand is not None:
-        new_bboxes.append(right_hand)
-        new_right.append(1)
-        new_vit_keypoints.append(right_hand_kp)
-
-    return np.array(new_bboxes), np.array(new_right), np.array(new_vit_keypoints)
-
-
-def draw_hand_landmarks_on_image(vis, landmarks, h, w):
-    """Draw hand landmarks on the visualization image."""
-    # Draw connections
-    for connection in HAND_CONNECTIONS:
-        start_idx, end_idx = connection
-        start_point = (int(landmarks[start_idx][0]), int(landmarks[start_idx][1]))
-        end_point = (int(landmarks[end_idx][0]), int(landmarks[end_idx][1]))
-        cv2.line(vis, start_point, end_point, (0, 255, 0), 1)
+def compute_iou(bbox1, bbox2):
+    """Compute IoU between two bboxes."""
+    x1_min, y1_min, x1_max, y1_max = bbox1
+    x2_min, y2_min, x2_max, y2_max = bbox2
     
-    # Draw landmarks
-    for lm in landmarks:
-        cv2.circle(vis, (int(lm[0]), int(lm[1])), 1, (0, 0, 255), -1)
-    return vis
-
-
-def run_mediapipe(img, vis):
-    # MediaPipe Tasks API for hand detection
-    base_options = mp_tasks.BaseOptions(model_asset_path=HAND_LANDMARKER_MODEL_PATH)
-    options = mp_vision.HandLandmarkerOptions(
-        base_options=base_options,
-        running_mode=mp_vision.RunningMode.IMAGE,
-        num_hands=2,
-        min_hand_detection_confidence=max(0.5, conf_thld_0),  # Tasks API requires >= 0
-        min_tracking_confidence=max(0.5, conf_thld_0)
-    )
+    inter_x_min = max(x1_min, x2_min)
+    inter_y_min = max(y1_min, y2_min)
+    inter_x_max = min(x1_max, x2_max)
+    inter_y_max = min(y1_max, y2_max)
     
-    with mp_vision.HandLandmarker.create_from_options(options) as landmarker:
-        # Convert BGR to RGB
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_rgb)
+    inter_area = max(0, inter_x_max - inter_x_min) * max(0, inter_y_max - inter_y_min)
+    bbox1_area = (x1_max - x1_min) * (y1_max - y1_min)
+    bbox2_area = (x2_max - x2_min) * (y2_max - y2_min)
+    union_area = bbox1_area + bbox2_area - inter_area
+    
+    return inter_area / union_area if union_area > 0 else 0
+
+
+def compute_containment_ratio(bbox1, bbox2):
+    """
+    Compute how much bbox1 is contained within bbox2.
+    Returns the ratio of bbox1's area that overlaps with bbox2.
+    """
+    x1_min, y1_min, x1_max, y1_max = bbox1
+    x2_min, y2_min, x2_max, y2_max = bbox2
+    
+    inter_x_min = max(x1_min, x2_min)
+    inter_y_min = max(y1_min, y2_min)
+    inter_x_max = min(x1_max, x2_max)
+    inter_y_max = min(y1_max, y2_max)
+    
+    inter_area = max(0, inter_x_max - inter_x_min) * max(0, inter_y_max - inter_y_min)
+    bbox1_area = (x1_max - x1_min) * (y1_max - y1_min)
+    
+    return inter_area / bbox1_area if bbox1_area > 0 else 0
+
+
+def create_video_from_images(image_folder, output_video_path, fps=30):
+    """Create MP4 video from images in a folder using imageio (same as src_cam video)."""
+    image_folder = Path(image_folder)
+    if not image_folder.exists():
+        print(f"Warning: {image_folder} does not exist, skipping video creation")
+        return
+    
+    # Get all jpg images sorted by filename
+    image_files = sorted(list(image_folder.glob('*.jpg')))
+    if len(image_files) == 0:
+        print(f"Warning: No images found in {image_folder}, skipping video creation")
+        return
+    
+    print(f"Creating video: {output_video_path}")
+    
+    # Load all images
+    frames = []
+    for img_file in tqdm(image_files, desc=f"  Loading frames"):
+        img = imageio.imread(str(img_file))
+        if img is not None:
+            frames.append(img)
+    
+    if len(frames) == 0:
+        print(f"Warning: Could not load any images from {image_folder}")
+        return
+    
+    # Write video using imageio (same method as src_cam video generation)
+    imageio.mimwrite(str(output_video_path), frames, fps=fps)
+    print(f"  Video saved: {output_video_path} ({len(frames)} frames @ {fps} fps)")
+
+
+# ============================================================================
+# PASS 1: Extract all raw bboxes using YOLO hand detector
+# ============================================================================
+
+def extract_raw_bboxes(img_paths, detector, vis_dir=None):
+    """
+    Pass 1: Extract raw hand bboxes using YOLO hand detector (like WiLoR).
+    YOLO directly detects hand bboxes with left/right classification.
+    No ViTPose needed - much simpler and more reliable!
+    
+    Args:
+        img_paths: List of image paths
+        detector: YOLO hand detector model
+        vis_dir: Optional directory for visualizations
+    
+    Returns:
+        raw_data: List of dicts for each frame with bbox data (no keypoints from YOLO)
+    """
+    print("\n" + "="*80)
+    print("PASS 1: Extracting raw hand bboxes (YOLO hand detector)")
+    print("="*80)
+    
+    if vis_dir is not None:
+        pass1_dir = os.path.join(vis_dir, 'pass1_raw_bboxes')
+        os.makedirs(pass1_dir, exist_ok=True)
+    
+    raw_data = []
+    
+    for frame_idx, img_path in enumerate(tqdm(sorted(img_paths), desc="Pass 1: Extracting hand bboxes")):
+        img_path = str(img_path)
+        img_cv2 = cv2.imread(img_path)
         
-        # Detect hand landmarks
-        results = landmarker.detect(mp_image)
+        frame_data = {
+            'frame_idx': frame_idx,
+            'img_path': img_path,
+            'left_bbox': None,
+            'right_bbox': None,
+            'left_keypoints': None,  # Will be None for YOLO version
+            'right_keypoints': None,  # Will be None for YOLO version
+            'left_conf': 0.0,
+            'right_conf': 0.0
+        }
         
-        h, w, c = img.shape
-        left_hand = None
-        right_hand = None
+        # YOLO direct hand detection (following WiLoR demo.py)
+        # Class 0 = left hand, Class 1 = right hand
+        detections = detector(img_cv2, conf=0.5, verbose=False)[0]
         
-        if results.hand_landmarks:
-            for hand_landmarks, handedness_list in zip(results.hand_landmarks, results.handedness):
-                handedness = handedness_list[0].category_name
+        # Track best detection for each hand (in case of duplicates)
+        left_detections = []
+        right_detections = []
+        
+        # Helper function to expand bbox by a given scale (e.g., 1.2x) and make it SQUARE
+        def enlarge_bbox(bbox, scale=1.2, img_shape=None):
+            x1, y1, x2, y2 = bbox
+            w = x2 - x1
+            h = y2 - y1
+            cx = x1 + w / 2.0
+            cy = y1 + h / 2.0
+            
+            # Make it square by taking the max dimension
+            size = max(w, h) * scale
+            
+            new_x1 = cx - size / 2.0
+            new_y1 = cy - size / 2.0
+            new_x2 = cx + size / 2.0
+            new_y2 = cy + size / 2.0
+            
+            # Optionally clip to image boundaries
+            if img_shape is not None:
+                H, W = img_shape[:2]
+                new_x1 = max(0, min(W-1, new_x1))
+                new_y1 = max(0, min(H-1, new_y1))
+                new_x2 = max(0, min(W-1, new_x2))
+                new_y2 = max(0, min(H-1, new_y2))
+            return np.array([new_x1, new_y1, new_x2, new_y2], dtype=bbox.dtype)
+
+        img_shape = img_cv2.shape
+        for det in detections:
+            bbox = det.boxes.xyxy[0].cpu().numpy() # x1, y1, x2, y2
+            conf = float(det.boxes.conf[0])
+            cls = int(det.boxes.cls[0])
+
+            # Enlarge bbox by 1.2x, clamp to image
+            bbox = enlarge_bbox(bbox, scale=1.2, img_shape=img_shape)
+
+            if cls == 0:  # left hand
+                left_detections.append({'bbox': bbox, 'conf': conf})
+            elif cls == 1:  # right hand
+                right_detections.append({'bbox': bbox, 'conf': conf})
+
+        # Keep highest confidence detection for each hand
+        if len(left_detections) > 0:
+            best_left = max(left_detections, key=lambda x: x['conf'])
+            frame_data['left_bbox'] = best_left['bbox']
+            frame_data['left_conf'] = best_left['conf']
+        
+        if len(right_detections) > 0:
+            best_right = max(right_detections, key=lambda x: x['conf'])
+            frame_data['right_bbox'] = best_right['bbox']
+            frame_data['right_conf'] = best_right['conf']
+        
+        # Visualize raw bboxes
+        if vis_dir is not None:
+            img_vis = img_cv2.copy()
+            if frame_data['left_bbox'] is not None:
+                x1, y1, x2, y2 = frame_data['left_bbox'].astype(int)
+                cv2.rectangle(img_vis, (x1, y1), (x2, y2), (255, 0, 0), 2)  # Blue for left
+                cv2.putText(img_vis, f"L (conf={frame_data['left_conf']:.2f})", 
+                           (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+            if frame_data['right_bbox'] is not None:
+                x1, y1, x2, y2 = frame_data['right_bbox'].astype(int)
+                cv2.rectangle(img_vis, (x1, y1), (x2, y2), (0, 255, 0), 2)  # Green for right
+                cv2.putText(img_vis, f"R (conf={frame_data['right_conf']:.2f})", 
+                           (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            
+            img_fn = os.path.splitext(os.path.basename(img_path))[0]
+            cv2.imwrite(os.path.join(pass1_dir, f'{img_fn}_raw.jpg'), img_vis)
+        
+        raw_data.append(frame_data)
+    
+    # Print statistics with missing frame details
+    left_count = sum(1 for f in raw_data if f['left_bbox'] is not None)
+    right_count = sum(1 for f in raw_data if f['right_bbox'] is not None)
+    missing_left = [i for i, f in enumerate(raw_data) if f['left_bbox'] is None]
+    missing_right = [i for i, f in enumerate(raw_data) if f['right_bbox'] is None]
+    
+    print(f"\nExtracted bboxes for {len(raw_data)} frames:")
+    print(f"  Left hand detected in {left_count} frames ({100*left_count/len(raw_data):.1f}%)")
+    print(f"  Right hand detected in {right_count} frames ({100*right_count/len(raw_data):.1f}%)")
+    
+    if len(missing_left) > 0:
+        print(f"  Missing left hand in {len(missing_left)} frames")
+        if len(missing_left) <= 20:
+            print(f"    Frame indices: {missing_left}")
+        else:
+            print(f"    First 10: {missing_left[:10]}")
+            print(f"    Last 10: {missing_left[-10:]}")
+    
+    if len(missing_right) > 0:
+        print(f"  Missing right hand in {len(missing_right)} frames")
+        if len(missing_right) <= 20:
+            print(f"    Frame indices: {missing_right}")
+        else:
+            print(f"    First 10: {missing_right[:10]}")
+            print(f"    Last 10: {missing_right[-10:]}")
+    
+    # Create video from Pass 1 visualizations
+    if vis_dir is not None:
+        pass1_dir = os.path.join(vis_dir, 'pass1_raw_bboxes')
+        video_path = os.path.join(vis_dir, 'pass1_raw_bboxes.mp4')
+        create_video_from_images(pass1_dir, video_path, fps=30)
+    
+    return raw_data
+
+
+# ============================================================================
+# PASS 2: Clean bbox sequences globally
+# ============================================================================
+
+def detect_overlapping_bboxes(raw_data, iou_threshold=0.7, containment_threshold=0.7):
+    """
+    Detect and remove overlapping bboxes (hallucinations) - YOLO version without keypoints.
+    Uses simplified criteria:
+    1. High bbox IoU (> 0.7) - very overlapping bboxes
+    2. High containment (> 0.7) - one bbox is largely contained in another
+
+    Since YOLO doesn't provide keypoints, we only use bbox-based overlap detection.
+    This is actually more reliable since YOLO is specifically trained for hand detection.
+
+    Also tracks which hand was removed due to overlap and which hand "caused" the removal,
+    so we can potentially restore the removed hand if the winner is later invalidated.
+    """
+    print("\nStep 1: Detecting overlapping bboxes")
+    
+    overlap_count = 0
+    
+    for frame_data in raw_data:
+        # Initialize removal tracking flags
+        frame_data['left_removed_due_to_overlap_with'] = None
+        frame_data['right_removed_due_to_overlap_with'] = None
+        if frame_data['left_bbox'] is not None and frame_data['right_bbox'] is not None:
+            # Criterion 1: Bbox IoU
+            iou = compute_iou(frame_data['left_bbox'], frame_data['right_bbox'])
+            
+            # Criterion 2: Containment ratio (either bbox contains the other)
+            left_in_right = compute_containment_ratio(frame_data['left_bbox'], frame_data['right_bbox'])
+            right_in_left = compute_containment_ratio(frame_data['right_bbox'], frame_data['left_bbox'])
+            max_containment = max(left_in_right, right_in_left)
+            
+            # Determine if this is an overlap/hallucination
+            is_overlap = False
+            reason = []
+            
+            if iou > iou_threshold:
+                is_overlap = True
+                reason.append(f"IoU={iou:.3f}")
+            
+            if max_containment > containment_threshold:
+                is_overlap = True
+                which_contained = "L_in_R" if left_in_right > right_in_left else "R_in_L"
+                reason.append(f"containment={max_containment:.2f} ({which_contained})")
+            
+            if is_overlap:
+                overlap_count += 1
+                print(f"  Frame {frame_data['frame_idx']:04d}: {', '.join(reason)} - OVERLAP DETECTED")
                 
-                lmList = []
-                for lm in hand_landmarks:
-                    px, py = int(lm.x * w), int(lm.y * h)
-                    lmList.append([px, py, 1])
-                
-                lmList_np = np.array(lmList)
-                
-                # Draw landmarks on vis
-                vis = draw_hand_landmarks_on_image(vis, lmList_np, h, w)
-                
-                # Note: MediaPipe returns handedness from the camera's perspective (mirrored)
-                if handedness == 'Left':
-                    cv2.putText(vis, f"Right",
-                                (0, 40), cv2.FONT_HERSHEY_DUPLEX,
-                                FONT_SIZE, HANDEDNESS_TEXT_COLOR, FONT_THICKNESS, cv2.LINE_AA)
-                    right_hand = lmList_np
-                elif handedness == 'Right':
-                    cv2.putText(vis, f"Left",
-                                (0, 80), cv2.FONT_HERSHEY_DUPLEX,
-                                FONT_SIZE, HANDEDNESS_TEXT_COLOR, FONT_THICKNESS, cv2.LINE_AA)
-                    left_hand = lmList_np
+                # Keep hand with higher confidence, track which hand was removed and why
+                if frame_data['left_conf'] > frame_data['right_conf']:
+                    print(f"    → Keeping LEFT (conf={frame_data['left_conf']:.3f}), removing RIGHT")
+                    frame_data['right_bbox'] = None
+                    frame_data['right_keypoints'] = None
+                    frame_data['right_conf'] = 0.0
+                    frame_data['right_removed_due_to_overlap_with'] = 'left'
                 else:
-                    raise ValueError(f"Unknown handedness: {handedness}")
-        
-        return left_hand, right_hand, vis
+                    print(f"    → Keeping RIGHT (conf={frame_data['right_conf']:.3f}), removing LEFT")
+                    frame_data['left_bbox'] = None
+                    frame_data['left_keypoints'] = None
+                    frame_data['left_conf'] = 0.0
+                    frame_data['left_removed_due_to_overlap_with'] = 'right'
+    
+    print(f"Removed overlapping bboxes in {overlap_count} frames")
+    return raw_data
 
+
+def fix_handedness_swaps_by_trajectory(raw_data, position_threshold=200):
+    """
+    Detect handedness swaps by analyzing trajectory jumps.
+    If one hand suddenly jumps to where the other hand was, it's likely mislabeled.
+
+    Example: Green curve (right) drops to blue curve's position while blue disappears
+    → The "right" detection is actually the left hand with wrong label
+    """
+    print("\nStep 2: Detecting handedness swaps via trajectory")
+    
+    swap_count = 0
+    n = len(raw_data)
+    
+    for i in range(1, n):
+        left_bbox = raw_data[i]['left_bbox']
+        right_bbox = raw_data[i]['right_bbox']
+        prev_left = raw_data[i-1]['left_bbox']
+        prev_right = raw_data[i-1]['right_bbox']
+        
+        # Case 1: Right hand jumps to where left hand was (left disappears)
+        if right_bbox is not None and left_bbox is None and prev_left is not None and prev_right is not None:
+            # Calculate positions
+            prev_left_cx = (prev_left[0] + prev_left[2]) / 2
+            prev_right_cx = (prev_right[0] + prev_right[2]) / 2
+            curr_right_cx = (right_bbox[0] + right_bbox[2]) / 2
+            
+            # Distance from current "right" to previous left/right
+            dist_to_prev_left = abs(curr_right_cx - prev_left_cx)
+            dist_to_prev_right = abs(curr_right_cx - prev_right_cx)
+            
+            # If current "right" is much closer to previous left than previous right, it's swapped
+            if dist_to_prev_left < dist_to_prev_right and dist_to_prev_right > position_threshold:
+                print(f"  Frame {i:04d}: RIGHT jumped to LEFT position (dist to prev_left={dist_to_prev_left:.0f}, dist to prev_right={dist_to_prev_right:.0f}) - Swapping RIGHT → LEFT")
+                raw_data[i]['left_bbox'] = right_bbox
+                raw_data[i]['left_keypoints'] = raw_data[i]['right_keypoints']
+                raw_data[i]['left_conf'] = raw_data[i]['right_conf']
+                raw_data[i]['right_bbox'] = None
+                raw_data[i]['right_keypoints'] = None
+                raw_data[i]['right_conf'] = 0.0
+                swap_count += 1
+        
+        # Case 2: Left hand jumps to where right hand was (right disappears)
+        elif left_bbox is not None and right_bbox is None and prev_right is not None and prev_left is not None:
+            # Calculate positions
+            prev_left_cx = (prev_left[0] + prev_left[2]) / 2
+            prev_right_cx = (prev_right[0] + prev_right[2]) / 2
+            curr_left_cx = (left_bbox[0] + left_bbox[2]) / 2
+            
+            # Distance from current "left" to previous left/right
+            dist_to_prev_left = abs(curr_left_cx - prev_left_cx)
+            dist_to_prev_right = abs(curr_left_cx - prev_right_cx)
+            
+            # If current "left" is much closer to previous right than previous left, it's swapped
+            if dist_to_prev_right < dist_to_prev_left and dist_to_prev_left > position_threshold:
+                print(f"  Frame {i:04d}: LEFT jumped to RIGHT position (dist to prev_right={dist_to_prev_right:.0f}, dist to prev_left={dist_to_prev_left:.0f}) - Swapping LEFT → RIGHT")
+                raw_data[i]['right_bbox'] = left_bbox
+                raw_data[i]['right_keypoints'] = raw_data[i]['left_keypoints']
+                raw_data[i]['right_conf'] = raw_data[i]['left_conf']
+                raw_data[i]['left_bbox'] = None
+                raw_data[i]['left_keypoints'] = None
+                raw_data[i]['left_conf'] = 0.0
+                swap_count += 1
+    
+    if swap_count > 0:
+        print(f"  Fixed {swap_count} trajectory-based handedness swaps")
+    else:
+        print(f"  No trajectory-based swaps detected")
+    
+    return raw_data
+
+
+def fix_handedness_swaps_frame_to_frame(raw_data, iou_threshold=0.7, max_gap=10):
+    """
+    Detect frame-to-frame handedness swaps: same bbox position but different label.
+
+    Example problem:
+    - Frame N:   Right hand at position X (green box)
+    - Frame N+1: Left hand at position X (blue box) - SAME BBOX, WRONG LABEL!
+
+    This catches YOLO randomly mislabeling the same physical hand.
+
+    Strategy:
+    If a hand suddenly appears while the other hand recently disappeared (within max_gap frames),
+    AND the new hand's bbox has high IoU with the disappeared hand's LAST VALID bbox,
+    → It's the same hand with wrong label! Swap it back!
+
+    Args:
+        max_gap: Maximum frames to look back for last valid other hand (default 10)
+    """
+    print(f"\nStep 3: Detecting frame-to-frame handedness swaps (IoU={iou_threshold}, max_gap={max_gap})")
+    
+    swap_count = 0
+    
+    for i in range(1, len(raw_data)):
+        curr = raw_data[i]
+        
+        for hand_name in ['left', 'right']:
+            bbox_key = f'{hand_name}_bbox'
+            keyp_key = f'{hand_name}_keypoints'
+            conf_key = f'{hand_name}_conf'
+            other_hand = 'right' if hand_name == 'left' else 'left'
+            other_bbox_key = f'{other_hand}_bbox'
+            other_keyp_key = f'{other_hand}_keypoints'
+            other_conf_key = f'{other_hand}_conf'
+            
+            curr_bbox = curr[bbox_key]
+            curr_other_bbox = curr[other_bbox_key]
+            
+            # Case: Current hand exists and other hand is missing
+            if curr_bbox is not None and curr_other_bbox is None:
+                # Look back to find LAST VALID bbox of OTHER hand (within max_gap frames)
+                last_valid_other_bbox = None
+                last_valid_other_idx = None
+                
+                for j in range(i - 1, max(0, i - max_gap - 1), -1):
+                    if raw_data[j][other_bbox_key] is not None:
+                        last_valid_other_bbox = raw_data[j][other_bbox_key]
+                        last_valid_other_idx = j
+                        break
+                
+                # If found a recent OTHER hand detection, check IoU
+                print(f"  Frame {curr['frame_idx']:04d}: {last_valid_other_bbox is not None}")
+                if last_valid_other_bbox is not None:
+                    gap = i - last_valid_other_idx
+                    iou = compute_iou(curr_bbox, last_valid_other_bbox)
+                    print(f"  Frame {curr['frame_idx']:04d}: IoU = {iou:.3f}")
+                    if iou > iou_threshold:
+                        print(f"  Frame {curr['frame_idx']:04d}: {hand_name} at same position as {other_hand} "
+                              f"(last seen at frame {raw_data[last_valid_other_idx]['frame_idx']}, gap={gap}, IoU={iou:.3f}) "
+                              f"- SWAPPING {hand_name} → {other_hand}")
+                        
+                        # Swap: this is actually the OTHER hand
+                        curr[other_bbox_key] = curr_bbox.copy()
+                        curr[other_keyp_key] = curr[keyp_key].copy() if curr[keyp_key] is not None else None
+                        curr[other_conf_key] = curr[conf_key]
+                        
+                        # Remove from current hand
+                        curr[bbox_key] = None
+                        curr[keyp_key] = None
+                        curr[conf_key] = 0.0
+                        
+                        swap_count += 1
+    
+    if swap_count > 0:
+        print(f"  Fixed {swap_count} frame-to-frame handedness swaps")
+    else:
+        print(f"  No frame-to-frame swaps detected")
+    
+    return raw_data
+
+
+def fix_handedness_inconsistencies(raw_data, original_data, context_window=5):
+    """
+    Detect handedness swaps using SPATIAL-TEMPORAL consistency.
+
+    Example problem: [L, L, L, _, _, R, R, R, L, L]
+    - The 3 Rs are spatially in the LEFT hand's trajectory but mislabeled as RIGHT
+
+    Strategy:
+    1. For each detection, compute IoU with recent detections of SAME hand
+    2. Also compute IoU with recent detections of OTHER hand
+    3. If IoU with OTHER hand's trajectory is much higher → handedness is swapped!
+    """
+    print(f"\nStep 4: Fixing handedness via spatial-temporal consistency (window={context_window})")
+    
+    swap_count = 0
+    
+    for i, frame_data in enumerate(raw_data):
+        for hand_name in ['left', 'right']:
+            bbox_key = f'{hand_name}_bbox'
+            keyp_key = f'{hand_name}_keypoints'
+            conf_key = f'{hand_name}_conf'
+            other_hand = 'right' if hand_name == 'left' else 'left'
+            other_bbox_key = f'{other_hand}_bbox'
+            other_keyp_key = f'{other_hand}_keypoints'
+            other_conf_key = f'{other_hand}_conf'
+            
+            current_bbox = frame_data[bbox_key]
+            if current_bbox is None:
+                continue
+            
+            # Collect recent bboxes for SAME hand and OTHER hand
+            same_hand_bboxes = []
+            other_hand_bboxes = []
+            
+            # Look at context window (both past and future)
+            for j in range(max(0, i - context_window), min(len(raw_data), i + context_window + 1)):
+                if j == i:
+                    continue  # Skip current frame
+                
+                # Collect SAME hand bboxes
+                if raw_data[j][bbox_key] is not None:
+                    same_hand_bboxes.append(raw_data[j][bbox_key])
+                
+                # Collect OTHER hand bboxes
+                if raw_data[j][other_bbox_key] is not None:
+                    other_hand_bboxes.append(raw_data[j][other_bbox_key])
+            
+            # Need enough context to make a decision
+            if len(same_hand_bboxes) < 2 and len(other_hand_bboxes) < 2:
+                continue  # Not enough spatial context
+            
+            # Compute average IoU with SAME hand trajectory
+            same_hand_ious = []
+            for bbox in same_hand_bboxes:
+                iou = compute_iou(current_bbox, bbox)
+                same_hand_ious.append(iou)
+            avg_iou_same = np.mean(same_hand_ious) if len(same_hand_ious) > 0 else 0.0
+            
+            # Compute average IoU with OTHER hand trajectory
+            other_hand_ious = []
+            for bbox in other_hand_bboxes:
+                iou = compute_iou(current_bbox, bbox)
+                other_hand_ious.append(iou)
+            avg_iou_other = np.mean(other_hand_ious) if len(other_hand_ious) > 0 else 0.0
+            
+            # DETECTION LOGIC: If current bbox fits OTHER hand's trajectory much better, it's swapped!
+            # Criteria:
+            # 1. OTHER hand trajectory has high overlap (>0.5) with current bbox
+            # 2. OTHER hand trajectory overlap is significantly higher than SAME hand (1.5x)
+            # 3. We have enough OTHER hand detections nearby (at least 3)
+            if (len(other_hand_bboxes) >= 3 and 
+                avg_iou_other > 0.5 and 
+                avg_iou_other > avg_iou_same * 1.5):
+                
+                print(f"  Frame {frame_data['frame_idx']:04d} ({hand_name}): "
+                      f"Bbox fits {other_hand} trajectory better! "
+                      f"(IoU with {hand_name}={avg_iou_same:.3f}, IoU with {other_hand}={avg_iou_other:.3f}, "
+                      f"neighbors: {len(same_hand_bboxes)} {hand_name}, {len(other_hand_bboxes)} {other_hand}) "
+                      f"- SWAPPING {hand_name} → {other_hand}")
+                
+                # Swap: move current bbox to OTHER hand
+                frame_data[other_bbox_key] = current_bbox.copy()
+                frame_data[other_keyp_key] = frame_data[keyp_key].copy() if frame_data[keyp_key] is not None else None
+                frame_data[other_conf_key] = frame_data[conf_key]
+                
+                # Remove from current hand
+                frame_data[bbox_key] = None
+                frame_data[keyp_key] = None
+                frame_data[conf_key] = 0.0
+                
+                swap_count += 1
+    
+    if swap_count > 0:
+        print(f"  Fixed {swap_count} handedness swaps via spatial-temporal consistency")
+    else:
+        print(f"  No spatial-temporal inconsistencies found")
+    
+    return raw_data
+
+
+def visualize_bbox_cleaning(raw_data, original_data, vis_dir):
+    """Visualize before/after bbox cleaning comparison."""
+    if vis_dir is None:
+        return
+
+    pass2_dir = os.path.join(vis_dir, 'pass2_cleaned_bboxes')
+    dash_length = 10
+
+    for i, frame_data in enumerate(raw_data):
+        img_path = frame_data['img_path']
+        img_cv2 = cv2.imread(img_path)
+        img_vis = img_cv2.copy()
+        orig = original_data[i]
+
+        # Draw original bboxes (dashed)
+        if orig['left_bbox'] is not None:
+            x1, y1, x2, y2 = orig['left_bbox'].astype(int)
+            for j in range(x1, x2, dash_length * 2):
+                cv2.line(img_vis, (j, y1), (min(j + dash_length, x2), y1), (173, 216, 230), 2)
+                cv2.line(img_vis, (j, y2), (min(j + dash_length, x2), y2), (173, 216, 230), 2)
+            for j in range(y1, y2, dash_length * 2):
+                cv2.line(img_vis, (x1, j), (x1, min(j + dash_length, y2)), (173, 216, 230), 2)
+                cv2.line(img_vis, (x2, j), (x2, min(j + dash_length, y2)), (173, 216, 230), 2)
+            cv2.putText(img_vis, "L_before", (x1, y1-30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (173, 216, 230), 2)
+
+        if orig['right_bbox'] is not None:
+            x1, y1, x2, y2 = orig['right_bbox'].astype(int)
+            for j in range(x1, x2, dash_length * 2):
+                cv2.line(img_vis, (j, y1), (min(j + dash_length, x2), y1), (144, 238, 144), 2)
+                cv2.line(img_vis, (j, y2), (min(j + dash_length, x2), y2), (144, 238, 144), 2)
+            for j in range(y1, y2, dash_length * 2):
+                cv2.line(img_vis, (x1, j), (x1, min(j + dash_length, y2)), (144, 238, 144), 2)
+                cv2.line(img_vis, (x2, j), (x2, min(j + dash_length, y2)), (144, 238, 144), 2)
+            cv2.putText(img_vis, "R_before", (x1, y1-30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (144, 238, 144), 2)
+
+        # Draw cleaned bboxes (solid) and keypoints
+        if frame_data['left_bbox'] is not None:
+            x1, y1, x2, y2 = frame_data['left_bbox'].astype(int)
+            cv2.rectangle(img_vis, (x1, y1), (x2, y2), (255, 0, 0), 3)
+            cv2.putText(img_vis, "L_after", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+            if frame_data['left_keypoints'] is not None:
+                for kp in frame_data['left_keypoints']:
+                    x, y, conf = kp
+                    if conf > 0.1:
+                        cv2.circle(img_vis, (int(x), int(y)), 3, (255, 0, 0), -1)
+
+        if frame_data['right_bbox'] is not None:
+            x1, y1, x2, y2 = frame_data['right_bbox'].astype(int)
+            cv2.rectangle(img_vis, (x1, y1), (x2, y2), (0, 255, 0), 3)
+            cv2.putText(img_vis, "R_after", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            if frame_data['right_keypoints'] is not None:
+                for kp in frame_data['right_keypoints']:
+                    x, y, conf = kp
+                    if conf > 0.1:
+                        cv2.circle(img_vis, (int(x), int(y)), 3, (0, 255, 0), -1)
+
+        img_fn = os.path.splitext(os.path.basename(img_path))[0]
+        cv2.imwrite(os.path.join(pass2_dir, f'{img_fn}_cleaned.jpg'), img_vis)
+
+
+def plot_bbox_trajectories(raw_data, vis_dir, filename='bbox_trajectories.png'):
+    """
+    Plot left and right hand bbox center trajectories over time.
+    This helps visualize handedness consistency and detect label swaps.
+    """
+    import matplotlib
+    matplotlib.use('Agg')  # Use non-interactive backend
+    import matplotlib.pyplot as plt
+    
+    frames = []
+    left_centers_x = []
+    left_centers_y = []
+    right_centers_x = []
+    right_centers_y = []
+    
+    for i, frame_data in enumerate(raw_data):
+        frames.append(i)
+        
+        # Left hand
+        if frame_data['left_bbox'] is not None:
+            left_cx = (frame_data['left_bbox'][0] + frame_data['left_bbox'][2]) / 2
+            left_cy = (frame_data['left_bbox'][1] + frame_data['left_bbox'][3]) / 2
+            left_centers_x.append(left_cx)
+            left_centers_y.append(left_cy)
+        else:
+            left_centers_x.append(None)
+            left_centers_y.append(None)
+        
+        # Right hand
+        if frame_data['right_bbox'] is not None:
+            right_cx = (frame_data['right_bbox'][0] + frame_data['right_bbox'][2]) / 2
+            right_cy = (frame_data['right_bbox'][1] + frame_data['right_bbox'][3]) / 2
+            right_centers_x.append(right_cx)
+            right_centers_y.append(right_cy)
+        else:
+            right_centers_x.append(None)
+            right_centers_y.append(None)
+    
+    # Create figure with 2 subplots
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(20, 10))
+    
+    # Plot X coordinates (horizontal position)
+    ax1.plot(frames, left_centers_x, 'b-', label='Left hand', linewidth=1.5, alpha=0.8)
+    ax1.plot(frames, right_centers_x, 'g-', label='Right hand', linewidth=1.5, alpha=0.8)
+    ax1.set_xlabel('Frame', fontsize=12)
+    ax1.set_ylabel('X coordinate (pixels)', fontsize=12)
+    ax1.set_title('Hand Bbox Center X-Position Over Time\n(Left hand should be consistently < Right hand)', fontsize=14, fontweight='bold')
+    ax1.legend(fontsize=11)
+    ax1.grid(True, alpha=0.3)
+    
+    # Highlight regions where left > right (potential swaps)
+    swap_count = 0
+    for i in range(len(frames)):
+        if left_centers_x[i] is not None and right_centers_x[i] is not None:
+            if left_centers_x[i] > right_centers_x[i]:
+                ax1.axvspan(i-0.5, i+0.5, alpha=0.3, color='red')
+                swap_count += 1
+    
+    # Plot Y coordinates (vertical position)
+    ax2.plot(frames, left_centers_y, 'b-', label='Left hand', linewidth=1.5, alpha=0.8)
+    ax2.plot(frames, right_centers_y, 'g-', label='Right hand', linewidth=1.5, alpha=0.8)
+    ax2.set_xlabel('Frame', fontsize=12)
+    ax2.set_ylabel('Y coordinate (pixels)', fontsize=12)
+    ax2.set_title('Hand Bbox Center Y-Position Over Time', fontsize=14, fontweight='bold')
+    ax2.legend(fontsize=11)
+    ax2.grid(True, alpha=0.3)
+    ax2.invert_yaxis()  # Invert Y axis since image coordinates go top-to-bottom
+    
+    plt.tight_layout()
+    save_path = os.path.join(vis_dir, filename)
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"\n{'='*80}")
+    print(f"Bbox trajectory plot saved to: {save_path}")
+    print(f"  Red regions indicate frames where left_x > right_x (potential label swaps)")
+    print(f"  Total frames with left_x > right_x: {swap_count}")
+    print(f"{'='*80}\n")
+
+
+def clean_bbox_sequences(raw_data, vis_dir=None):
+    """Pass 2: Clean bbox sequences using global temporal information."""
+    print("\n" + "="*80)
+    print("PASS 2: Cleaning bbox sequences")
+    print("="*80)
+    
+    if vis_dir is not None:
+        pass2_dir = os.path.join(vis_dir, 'pass2_cleaned_bboxes')
+        os.makedirs(pass2_dir, exist_ok=True)
+    
+    # Store original bboxes and keypoints for comparison and restoration
+    original_data = [{
+        'left_bbox': f['left_bbox'].copy() if f['left_bbox'] is not None else None,
+        'right_bbox': f['right_bbox'].copy() if f['right_bbox'] is not None else None,
+        'left_keypoints': f['left_keypoints'].copy() if f['left_keypoints'] is not None else None,
+        'right_keypoints': f['right_keypoints'].copy() if f['right_keypoints'] is not None else None,
+        'left_conf': f['left_conf'] if f['left_conf'] is not None else None,
+        'right_conf': f['right_conf'] if f['right_conf'] is not None else None,
+    } for f in raw_data]
+    
+    # Plot trajectories BEFORE cleaning
+    if vis_dir is not None:
+        plot_bbox_trajectories(raw_data, vis_dir, filename='bbox_trajectories_before_cleaning.png')
+    
+    # Remove oversized bboxes (> 50% of image area)
+    print("\nRemoving oversized bboxes (> 50% of image area)")
+    MAX_BBOX_AREA_RATIO = 0.5
+    removed_oversized = 0
+    
+    # Load first image to get dimensions (all images should have same size)
+    first_img = cv2.imread(raw_data[0]['img_path'])
+    img_area = first_img.shape[0] * first_img.shape[1]
+    
+    for frame_data in raw_data:
+        for hand_name in ['left', 'right']:
+            bbox_key = f'{hand_name}_bbox'
+            keyp_key = f'{hand_name}_keypoints'
+            conf_key = f'{hand_name}_conf'
+            
+            bbox = frame_data[bbox_key]
+            if bbox is not None:
+                bbox_width = bbox[2] - bbox[0]
+                bbox_height = bbox[3] - bbox[1]
+                bbox_area = bbox_width * bbox_height
+                area_ratio = bbox_area / img_area
+                
+                if area_ratio > MAX_BBOX_AREA_RATIO:
+                    print(f"  Frame {frame_data['frame_idx']:04d} ({hand_name}): "
+                          f"Bbox too large ({area_ratio:.1%} of image) - REMOVING")
+                    frame_data[bbox_key] = None
+                    frame_data[keyp_key] = None
+                    frame_data[conf_key] = 0.0
+                    removed_oversized += 1
+    
+    if removed_oversized > 0:
+        print(f"  Removed {removed_oversized} oversized bboxes")
+    else:
+        print(f"  No oversized bboxes found")
+    
+    raw_data = detect_overlapping_bboxes(raw_data, iou_threshold=0.7)
+    raw_data = fix_handedness_swaps_by_trajectory(raw_data, position_threshold=200)
+    raw_data = fix_handedness_inconsistencies(raw_data, original_data, context_window=5)
+    raw_data = fix_handedness_swaps_frame_to_frame(raw_data, iou_threshold=0.6)
+    
+    # Apply patience mechanism with interpolation when hand reappears
+    print("\nApplying patience mechanism with interpolation")
+    PATIENCE_FRAMES = 25
+    MAX_PATIENCE_WITHOUT_RETURN = 0  # No padding if hand never reappears
+    patience_applied_count = 0
+    interpolated_count = 0
+    trimmed_count = 0
+    
+    for hand_id in [0, 1]:
+        hand_name = 'left' if hand_id == 0 else 'right'
+        bbox_key = f'{hand_name}_bbox'
+        keyp_key = f'{hand_name}_keypoints'
+        conf_key = f'{hand_name}_conf'
+        
+        i = 0
+        while i < len(raw_data):
+            # Find start of a gap (hand missing)
+            if raw_data[i][bbox_key] is None:
+                # Look back to find last valid bbox
+                last_valid_idx = None
+                for j in range(i - 1, -1, -1):
+                    if raw_data[j][bbox_key] is not None:
+                        last_valid_idx = j
+                        break
+                
+                if last_valid_idx is None:
+                    i += 1
+                    continue
+                
+                # Find end of gap (hand reappears or sequence ends)
+                gap_start = i
+                gap_end = None
+                for j in range(i, min(i + PATIENCE_FRAMES, len(raw_data))):
+                    if raw_data[j][bbox_key] is not None:
+                        gap_end = j
+                        break
+                
+                if gap_end is not None:
+                    # Hand reappeared within patience threshold - CHECK DISTANCE FIRST
+                    gap_length = gap_end - gap_start
+                    start_bbox = raw_data[last_valid_idx][bbox_key]
+                    end_bbox = raw_data[gap_end][bbox_key]
+                    
+                    # Compute center distance between start and end bbox
+                    start_cx = (start_bbox[0] + start_bbox[2]) / 2
+                    start_cy = (start_bbox[1] + start_bbox[3]) / 2
+                    end_cx = (end_bbox[0] + end_bbox[2]) / 2
+                    end_cy = (end_bbox[1] + end_bbox[3]) / 2
+                    center_distance = np.sqrt((end_cx - start_cx)**2 + (end_cy - start_cy)**2)
+                    
+                    # Compute bbox width (use average of start and end)
+                    start_width = start_bbox[2] - start_bbox[0]
+                    end_width = end_bbox[2] - end_bbox[0]
+                    avg_width = (start_width + end_width) / 2
+                    
+                    # Only interpolate if bboxes are close enough (within 2× bbox width)
+                    max_distance = avg_width
+                    
+                    if center_distance <= max_distance:
+                        # Bboxes are close - INTERPOLATE
+                        print(f"  {hand_name.capitalize()}: Interpolating frames {gap_start}-{gap_end-1} "
+                              f"(gap={gap_length}, from frame {last_valid_idx} to {gap_end}, "
+                              f"distance={center_distance:.1f}px < {max_distance:.1f}px)")
+                        
+                        # Total distance includes the step from last_valid to gap_start
+                        # and from gap_end-1 to gap_end
+                        total_steps = gap_end - last_valid_idx
+                        
+                        for j in range(gap_start, gap_end):
+                            # Linear interpolation: evenly distribute motion across all steps
+                            alpha = (j - last_valid_idx) / total_steps
+                            interp_bbox = (1 - alpha) * start_bbox + alpha * end_bbox
+                            raw_data[j][bbox_key] = interp_bbox
+                            
+                            # Create dummy keypoints
+                            dummy_keypoints = np.zeros((21, 3))
+                            dummy_keypoints[:, 2] = 0.5
+                            raw_data[j][keyp_key] = dummy_keypoints
+                            raw_data[j][conf_key] = 0.5
+                            interpolated_count += 1
+                        
+                        i = gap_end
+                    else:
+                        # Bboxes are too far apart - DON'T interpolate, treat as separate instances
+                        print(f"  {hand_name.capitalize()}: Skipping interpolation for frames {gap_start}-{gap_end-1} "
+                              f"(distance={center_distance:.1f}px > {max_distance:.1f}px - likely different hand instances)")
+                        
+                        # Move to the next detection without filling the gap
+                        i = gap_end
+                else:
+                    # Hand never reappeared within patience threshold
+                    # Apply limited patience (only MAX_PATIENCE_WITHOUT_RETURN frames), then skip the rest
+                    last_bbox = raw_data[last_valid_idx][bbox_key]
+                    frames_to_fill = min(MAX_PATIENCE_WITHOUT_RETURN, len(raw_data) - gap_start)
+                    
+                    if frames_to_fill > 0:
+                        print(f"  {hand_name.capitalize()}: Applying static patience for frames {gap_start}-{gap_start + frames_to_fill - 1} "
+                              f"(hand never reappeared, using last bbox from frame {last_valid_idx})")
+                    
+                    for j in range(gap_start, gap_start + frames_to_fill):
+                        raw_data[j][bbox_key] = last_bbox.copy()
+                        
+                        # Create dummy keypoints
+                        dummy_keypoints = np.zeros((21, 3))
+                        dummy_keypoints[:, 2] = 0.5
+                        raw_data[j][keyp_key] = dummy_keypoints
+                        raw_data[j][conf_key] = 0.5
+                        patience_applied_count += 1
+                    
+                    # Skip ahead to find where hand reappears (or end of sequence)
+                    next_valid_idx = None
+                    for j in range(gap_start + frames_to_fill, len(raw_data)):
+                        if raw_data[j][bbox_key] is not None:
+                            next_valid_idx = j
+                            break
+                    
+                    # Jump to next valid detection or end of sequence
+                    i = next_valid_idx if next_valid_idx is not None else len(raw_data)
+            else:
+                i += 1
+    
+    if interpolated_count > 0:
+        print(f"  Interpolated {interpolated_count} frames where hand reappeared within patience threshold")
+    if patience_applied_count > 0:
+        print(f"  Applied static patience to {patience_applied_count} frames where hand never reappeared")
+    if interpolated_count == 0 and patience_applied_count == 0:
+        print(f"  No patience needed")
+    
+    # Remove spurious short motions (brief appearances after long absence)
+    # This runs AFTER patience to filter out hallucinations that patience might have extended
+    print("\nRemoving spurious short motions")
+    MIN_MOTION_DURATION = 30  # Motion must last at least this many frames
+    MIN_ABSENCE_BEFORE = 30   # Must be absent for this long before
+    MIN_ABSENCE_AFTER = 30    # Must be absent for this long after
+    
+    for hand_name in ['left', 'right']:
+        bbox_key = f'{hand_name}_bbox'
+        keyp_key = f'{hand_name}_keypoints'
+        conf_key = f'{hand_name}_conf'
+        
+        # Find all continuous segments where hand is present
+        segments = []
+        start_idx = None
+        
+        for i, frame_data in enumerate(raw_data):
+            if frame_data[bbox_key] is not None:
+                if start_idx is None:
+                    start_idx = i  # Start of a new segment
+            else:
+                if start_idx is not None:
+                    # End of a segment
+                    segments.append((start_idx, i - 1))
+                    start_idx = None
+        
+        # Don't forget the last segment if it extends to the end
+        if start_idx is not None:
+            segments.append((start_idx, len(raw_data) - 1))
+        
+        # Check each segment
+        removed_segments = []
+        for seg_start, seg_end in segments:
+            seg_duration = seg_end - seg_start + 1
+            
+            # Check absence before
+            absence_before = seg_start  # frames before this segment
+            
+            # Check absence after
+            absence_after = len(raw_data) - 1 - seg_end  # frames after this segment
+            
+            # If this is a short motion after long absence and before long absence, remove it
+            if (seg_duration < MIN_MOTION_DURATION and 
+                absence_before >= MIN_ABSENCE_BEFORE and 
+                absence_after >= MIN_ABSENCE_AFTER):
+                
+                print(f"  {hand_name.capitalize()}: Removing spurious short motion at frames {seg_start}-{seg_end} "
+                      f"(duration={seg_duration}, absence_before={absence_before}, absence_after={absence_after})")
+                
+                # Remove this segment
+                for i in range(seg_start, seg_end + 1):
+                    raw_data[i][bbox_key] = None
+                    raw_data[i][keyp_key] = None
+                    raw_data[i][conf_key] = 0.0
+                
+                removed_segments.append((seg_start, seg_end))
+        
+        if len(removed_segments) > 0:
+            print(f"  {hand_name.capitalize()}: Removed {len(removed_segments)} spurious short motion segments")
+        else:
+            print(f"  {hand_name.capitalize()}: No spurious short motions found")
+
+    # Re-check for overlaps after patience mechanism
+    print("\nRe-checking overlaps after interpolation")
+    raw_data = detect_overlapping_bboxes(raw_data, iou_threshold=0.7)
+
+    # Restore hands that were removed due to overlap, but ONLY if the "winner" hand was
+    # subsequently invalidated by other checks (handedness consistency).
+    # Logic: If LEFT was removed because RIGHT had higher confidence, but then RIGHT itself
+    # was removed by handedness check, we should restore LEFT since it was the original detection.
+    print("\nRestoring hands removed by overlap if winner was invalidated")
+    restored_count = 0
+    for i, (frame_data, orig) in enumerate(zip(raw_data, original_data)):
+        for hand_name in ['left', 'right']:
+            bbox_key = f'{hand_name}_bbox'
+            keyp_key = f'{hand_name}_keypoints'
+            conf_key = f'{hand_name}_conf'
+            removal_flag = f'{hand_name}_removed_due_to_overlap_with'
+            
+            # Check if this hand was removed due to overlap
+            if frame_data.get(removal_flag) is not None:
+                other_hand = frame_data[removal_flag]  # The hand that "won" the overlap check
+                other_bbox_key = f'{other_hand}_bbox'
+                other_handedness_flag = f'{other_hand}_removed_by_handedness_check'
+                
+                # Check if the "winner" hand was subsequently removed by handedness check
+                if frame_data.get(other_handedness_flag, False):
+                    print(f"  Frame {i}: Restoring {hand_name} hand (winner '{other_hand}' was invalidated)")
+                    # Restore original keypoints and confidence
+                    if orig[keyp_key] is not None:
+                        frame_data[bbox_key] = orig[bbox_key].copy()
+                        frame_data[keyp_key] = orig[keyp_key].copy()
+                        frame_data[conf_key] = orig[conf_key]
+                    else:
+                        # Create dummy keypoints if original didn't have them
+                        dummy_keypoints = np.zeros((21, 3))
+                        dummy_keypoints[:, 2] = 0.5
+                        frame_data[keyp_key] = dummy_keypoints
+                        frame_data[conf_key] = 0.5
+                    # Clear the removal flag since we've restored it
+                    frame_data[removal_flag] = None
+                    restored_count += 1
+    
+    raw_data = fix_handedness_swaps_frame_to_frame(raw_data, iou_threshold=0.6)
+
+    if restored_count > 0:
+        print(f"  Restored {restored_count} hand instances")
+    else:
+        print(f"  No hands needed restoration")
+
+    # Visualize before/after comparison
+    visualize_bbox_cleaning(raw_data, original_data, vis_dir)
+
+    # Create video from Pass 2 visualizations
+    if vis_dir is not None:
+        pass2_dir = os.path.join(vis_dir, 'pass2_cleaned_bboxes')
+        video_path = os.path.join(vis_dir, 'pass2_cleaned_bboxes.mp4')
+        create_video_from_images(pass2_dir, video_path, fps=30)
+        
+        # Plot bbox trajectories to visualize handedness consistency
+        plot_bbox_trajectories(raw_data, vis_dir, filename='bbox_trajectories_after_cleaning.png')
+    
+    print("\n" + "="*80)
+    print("PASS 2 Complete: Bbox sequences cleaned")
+    print("="*80)
+    
+    return raw_data
+
+
+# ============================================================================
+# PASS 3: Run HaMeR on cleaned bboxes
+# ============================================================================
 
 def convert_crop_coords_to_orig_img(bbox, keypoints, crop_size):
-    # import IPython; IPython.embed(); exit()
+    """Convert cropped coordinates to original image coordinates."""
     cx, cy, h = bbox[:, 0], bbox[:, 1], bbox[:, 2]
-
-    # unnormalize to crop coords
-    # keypoints = 0.5 * crop_size * (keypoints + 1.0)
-
-    # rescale to orig img crop
     keypoints *= h[..., None, None] / crop_size
-
-    # transform into original image coords
-    keypoints[:, :, 0] = (cx - h/2)[..., None] + keypoints[:, :, 0]
-    keypoints[:, :, 1] = (cy - h/2)[..., None] + keypoints[:, :, 1]
+    keypoints[:,:,0] = (cx - h/2)[..., None] + keypoints[:,:,0]
+    keypoints[:,:,1] = (cy - h/2)[..., None] + keypoints[:,:,1]
     return keypoints
 
 
-def get_keypoints_rectangle(keypoints: np.array, threshold: float) -> Tuple[float, float, float]:
-    """
-    Compute rectangle enclosing keypoints above the threshold.
-    Args:
-        keypoints (np.array): Keypoint array of shape (N, 3).
-        threshold (float): Confidence visualization threshold.
-    Returns:
-        Tuple[float, float, float]: Rectangle width, height and area.
-    """
-    print(keypoints.shape)
-    valid_ind = keypoints[:, -1] > threshold
-    if valid_ind.sum() > 0:
-        valid_keypoints = keypoints[valid_ind][:, :-1]
-        max_x = valid_keypoints[:, 0].max()
-        max_y = valid_keypoints[:, 1].max()
-        min_x = valid_keypoints[:, 0].min()
-        min_y = valid_keypoints[:, 1].min()
-        width = max_x - min_x
-        height = max_y - min_y
-        area = width * height
-        return width, height, area
-    else:
-        return 0, 0, 0
-
-
-def render_keypoints(img: np.array,
-                     keypoints: np.array,
-                     pairs: List,
-                     colors: List,
-                     thickness_circle_ratio: float,
-                     thickness_line_ratio_wrt_circle: float,
-                     pose_scales: List,
-                     threshold: float = 0.1,
-                     alpha: float = 1.0) -> np.array:
-    """
-    Render keypoints on input image.
-    Args:
-        img (np.array): Input image of shape (H, W, 3) with pixel values in the [0,255] range.
-        keypoints (np.array): Keypoint array of shape (N, 3).
-        pairs (List): List of keypoint pairs per limb.
-        colors: (List): List of colors per keypoint.
-        thickness_circle_ratio (float): Circle thickness ratio.
-        thickness_line_ratio_wrt_circle (float): Line thickness ratio wrt the circle.
-        pose_scales (List): List of pose scales.
-        threshold (float): Only visualize keypoints with confidence above the threshold.
-    Returns:
-        (np.array): Image of shape (H, W, 3) with keypoints drawn on top of the original image. 
-    """
-    img_orig = img.copy()
-    width, height = img.shape[1], img.shape[2]
-    area = width * height
-
-    lineType = 8
-    shift = 0
-    numberColors = len(colors)
-    thresholdRectangle = 0.1
-
-    person_width, person_height, person_area = get_keypoints_rectangle(
-        keypoints, thresholdRectangle)
-    if person_area > 0:
-        ratioAreas = min(1, max(person_width / width, person_height / height))
-        thicknessRatio = np.maximum(
-            np.round(math.sqrt(area) * thickness_circle_ratio * ratioAreas), 2)
-        thicknessCircle = np.maximum(
-            1, thicknessRatio if ratioAreas > 0.05 else -np.ones_like(thicknessRatio))
-        thicknessLine = np.maximum(1, np.round(
-            thicknessRatio * thickness_line_ratio_wrt_circle))
-        radius = thicknessRatio / 2
-
-        img = np.ascontiguousarray(img.copy())
-        for i, pair in enumerate(pairs):
-            index1, index2 = pair
-            if keypoints[index1, -1] > threshold and keypoints[index2, -1] > threshold:
-                thicknessLineScaled = int(
-                    round(min(thicknessLine[index1], thicknessLine[index2]) * pose_scales[0]))
-                colorIndex = index2
-                color = colors[colorIndex % numberColors]
-                keypoint1 = keypoints[index1, :-1].astype(np.int32)
-                keypoint2 = keypoints[index2, :-1].astype(np.int32)
-                cv2.line(img, tuple(keypoint1.tolist()), tuple(keypoint2.tolist()), tuple(
-                    color.tolist()), thicknessLineScaled, lineType, shift)
-        for part in range(len(keypoints)):
-            faceIndex = part
-            if keypoints[faceIndex, -1] > threshold:
-                radiusScaled = int(round(radius[faceIndex] * pose_scales[0]))
-                thicknessCircleScaled = int(
-                    round(thicknessCircle[faceIndex] * pose_scales[0]))
-                colorIndex = part
-                color = colors[colorIndex % numberColors]
-                center = keypoints[faceIndex, :-1].astype(np.int32)
-                cv2.circle(img, tuple(center.tolist()), radiusScaled, tuple(
-                    color.tolist()), thicknessCircleScaled, lineType, shift)
-    return img
-
-
-def render_hand_keypoints(img, right_hand_keypoints, threshold=0.1, use_confidence=False, map_fn=lambda x: np.ones_like(x), alpha=1.0):
-    if use_confidence and map_fn is not None:
-        # thicknessCircleRatioLeft = 1./50 * map_fn(left_hand_keypoints[:, -1])
-        thicknessCircleRatioRight = 1./50 * map_fn(right_hand_keypoints[:, -1])
-    else:
-        # thicknessCircleRatioLeft = 1./50 * np.ones(left_hand_keypoints.shape[0])
-        thicknessCircleRatioRight = 1./50 * \
-            np.ones(right_hand_keypoints.shape[0])
-    thicknessLineRatioWRTCircle = 0.75
-    pairs = [0, 1,  1, 2,  2, 3,  3, 4,  0, 5,  5, 6,  6, 7,  7, 8,  0, 9,  9, 10,  10,
-             11,  11, 12,  0, 13,  13, 14,  14, 15,  15, 16,  0, 17,  17, 18,  18, 19,  19, 20]
-    pairs = np.array(pairs).reshape(-1, 2)
-
-    colors = [100.,  100.,  100.,
-              100.,    0.,    0.,
-              150.,    0.,    0.,
-              200.,    0.,    0.,
-              255.,    0.,    0.,
-              100.,  100.,    0.,
-              150.,  150.,    0.,
-              200.,  200.,    0.,
-              255.,  255.,    0.,
-              0.,  100.,   50.,
-              0.,  150.,   75.,
-              0.,  200.,  100.,
-              0.,  255.,  125.,
-              0.,   50.,  100.,
-              0.,   75.,  150.,
-              0.,  100.,  200.,
-              0.,  125.,  255.,
-              100.,    0.,  100.,
-              150.,    0.,  150.,
-              200.,    0.,  200.,
-              255.,    0.,  255.]
-    colors = np.array(colors).reshape(-1, 3)
-    # colors = np.zeros_like(colors)
-    poseScales = [1]
-    # img = render_keypoints(img, left_hand_keypoints, pairs, colors, thicknessCircleRatioLeft, thicknessLineRatioWRTCircle, poseScales, threshold, alpha=alpha)
-    img = render_keypoints(img, right_hand_keypoints, pairs, colors, thicknessCircleRatioRight,
-                           thicknessLineRatioWRTCircle, poseScales, threshold, alpha=alpha)
-    # img = render_keypoints(img, right_hand_keypoints, pairs, colors, thickness_circle_ratio, thickness_line_ratio_wrt_circle, pose_scales, 0.1)
-    return img
-
-
-def render_body_keypoints(img: np.array,
-                          body_keypoints: np.array) -> np.array:
-    """
-    Render OpenPose body keypoints on input image.
-    Args:
-        img (np.array): Input image of shape (H, W, 3) with pixel values in the [0,255] range.
-        body_keypoints (np.array): Keypoint array of shape (N, 3); 3 <====> (x, y, confidence).
-    Returns:
-        (np.array): Image of shape (H, W, 3) with keypoints drawn on top of the original image. 
-    """
-
-    thickness_circle_ratio = 1./75. * np.ones(body_keypoints.shape[0])
-    thickness_line_ratio_wrt_circle = 0.75
-    pairs = []
-    pairs = [1, 8, 1, 2, 1, 5, 2, 3, 3, 4, 5, 6, 6, 7, 8, 9, 9, 10, 10, 11, 8, 12, 12, 13, 13,
-             14, 1, 0, 0, 15, 15, 17, 0, 16, 16, 18, 14, 19, 19, 20, 14, 21, 11, 22, 22, 23, 11, 24]
-    pairs = np.array(pairs).reshape(-1, 2)
-    colors = [255.,     0.,     85.,
-              255.,     0.,     0.,
-              255.,    85.,     0.,
-              255.,   170.,     0.,
-              255.,   255.,     0.,
-              170.,   255.,     0.,
-              85.,   255.,     0.,
-              0.,   255.,     0.,
-              255.,     0.,     0.,
-              0.,   255.,    85.,
-              0.,   255.,   170.,
-              0.,   255.,   255.,
-              0.,   170.,   255.,
-              0.,    85.,   255.,
-              0.,     0.,   255.,
-              255.,     0.,   170.,
-              170.,     0.,   255.,
-              255.,     0.,   255.,
-              85.,     0.,   255.,
-              0.,     0.,   255.,
-              0.,     0.,   255.,
-              0.,     0.,   255.,
-              0.,   255.,   255.,
-              0.,   255.,   255.,
-              0.,   255.,   255.]
-    colors = np.array(colors).reshape(-1, 3)
-    pose_scales = [1]
-    return render_keypoints(img, body_keypoints, pairs, colors, thickness_circle_ratio, thickness_line_ratio_wrt_circle, pose_scales, 0.1)
-
-
-def render_openpose(img: np.array,
-                    hand_keypoints: np.array) -> np.array:
-    """
-    Render keypoints in the OpenPose format on input image.
-    Args:
-        img (np.array): Input image of shape (H, W, 3) with pixel values in the [0,255] range.
-        body_keypoints (np.array): Keypoint array of shape (N, 3); 3 <====> (x, y, confidence).
-    Returns:
-        (np.array): Image of shape (H, W, 3) with keypoints drawn on top of the original image. 
-    """
-    # img = render_body_keypoints(img, body_keypoints)
-    img = render_hand_keypoints(img, hand_keypoints)
-    return img
-
-
-def save_video(path, out_dir, out_name):
-    print('saving to :', out_name + '.mp4')
-    img_array = []
-    height, width = 0, 0
-    for filename in tqdm(sorted(os.listdir(path))):
-        # for filename in tqdm(sorted(os.listdir(path), key=lambda x:int(os.path.basename(x).split('.')[0]))):
-        img = cv2.imread(path + '/' + filename)
-        if height != 0:
-            img = cv2.resize(img, (width, height))
-        height, width, _ = img.shape
-        size = (width, height)
-        img_array.append(img)
-
-    out = cv2.VideoWriter(os.path.join(
-        out_dir, out_name + '.mp4'), 0x7634706d, 30, size)
-    for i in range(len(img_array)):
-        out.write(img_array[i])
-    out.release()
-    print('done')
-
-
-def main():
-    parser = argparse.ArgumentParser(description='HaMeR demo code')
-    parser.add_argument('--data_dir', type=str, required=True)
-    parser.add_argument('--vitpose_dir', type=str, required=True)
-    parser.add_argument('--img_folder', type=str,
-                        default='images', help='Folder with input images')
-    parser.add_argument('--out_folder', type=str, default='out_demo',
-                        help='Output folder to save rendered results')
-    parser.add_argument('--res_folder', type=str,
-                        help='Output folder to save rendered results')
-    parser.add_argument('--side_view', dest='side_view', action='store_true',
-                        default=False, help='If set, render side view also')
-    parser.add_argument('--full_frame', dest='full_frame', action='store_true',
-                        default=True, help='If set, render all people together also')
-    parser.add_argument('--save_mesh', dest='save_mesh', action='store_true',
-                        default=False, help='If set, save meshes to disk also')
-    parser.add_argument('--batch_size', type=int, default=1,
-                        help='Batch size for inference/fitting')
-    parser.add_argument('--rescale_factor', type=float,
-                        default=2.0, help='Factor for padding the bbox')
-    parser.add_argument('--file_type', nargs='+',
-                        default=['*.jpg', '*.png'], help='List of file extensions to consider')
-    parser.add_argument('--conf', type=float, default=2.0,
-                        help='Factor for padding the bbox')
-    parser.add_argument('--type', type=str, default='EgoDexter',
-                        help='Path to pretrained model checkpoint')
-    parser.add_argument('--render', dest='render', action='store_true',
-                        default=False, help='If set, render side view also')
-
-    args = parser.parse_args()
-
-    model, model_cfg = load_hamer(args.data_dir)
-
-    # Setup HaMeR model
-    device = torch.device(
-        'cuda') if torch.cuda.is_available() else torch.device('cpu')
-    model = model.to(device)
-    model.eval()
-
-    # Load detector
-    from hamer.utils.utils_detectron2 import DefaultPredictor_Lazy
-    from detectron2.config import LazyConfig
-    import hamer
-    cfg_path = Path(hamer.__file__).parent/'configs' / \
-        'cascade_mask_rcnn_vitdet_h_75ep.py'
-    detectron2_cfg = LazyConfig.load(str(cfg_path))
-    detectron2_cfg.train.init_checkpoint = "https://dl.fbaipublicfiles.com/detectron2/ViTDet/COCO/cascade_mask_rcnn_vitdet_h/f328730692/model_final_f05665.pkl"
-    for i in range(3):
-        detectron2_cfg.model.roi_heads.box_predictors[i].test_score_thresh = 0.25
-    detector = DefaultPredictor_Lazy(detectron2_cfg)
-
-    # keypoint detector
-    cpm = ViTPoseModel(
-        vitpose_dir=args.vitpose_dir,
-        data_dir=args.data_dir,
-        device=device)
-
-    # Setup the renderer
-    renderer = Renderer(model_cfg, faces=model.mano.faces)
-
-    # Make output directory if it does not exist
-    args.out_folder = args.out_folder + '_' + str(model_cfg.EXTRA.FOCAL_LENGTH)
-    # os.makedirs(args.out_folder, exist_ok=True)
-    render_save_path = os.path.join(os.path.dirname(
-        args.res_folder), f'render_all_{model_cfg.EXTRA.FOCAL_LENGTH}')
-    # depth_save_path = os.path.join(os.path.dirname(args.res_folder), 'depth_all')
-    joint2d_save_path = os.path.join(os.path.dirname(
-        args.res_folder), f'joint2d_{model_cfg.EXTRA.FOCAL_LENGTH}')
-    vit_save_path = os.path.join(os.path.dirname(
-        args.res_folder), f'vit_{model_cfg.EXTRA.FOCAL_LENGTH}')
-    mesh_dir = os.path.join(os.path.dirname(
-        args.res_folder), f'mesh_{model_cfg.EXTRA.FOCAL_LENGTH}')
-    os.makedirs(render_save_path, exist_ok=True)
-    os.makedirs(joint2d_save_path, exist_ok=True)
-    os.makedirs(vit_save_path, exist_ok=True)
-    # os.makedirs(depth_save_path, exist_ok=True)
-    os.makedirs(mesh_dir, exist_ok=True)
-    os.makedirs(os.path.dirname(args.res_folder), exist_ok=True)
-
-    # Get all demo images ends with .jpg or .png
-    img_paths = [img for end in args.file_type for img in Path(
-        args.img_folder).glob(end)]
-
-    # Iterate over all images in folder
-    img_list = []
-    print('start iteration.')
+def run_hamer_on_cleaned_bboxes(raw_data, model, model_cfg, renderer, args):
+    """Pass 3: Run HaMeR on cleaned bboxes."""
+    print("\n" + "="*80)
+    print("PASS 3: Running HaMeR on cleaned bboxes")
+    print("="*80)
+    
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     results_dict = {}
-
-    big_all_verts = []
-    big_all_cam_t = []
-    big_all_joints = []
-    big_all_right = []
-
-    tid = []
-    x = 0
-    tracked_time = [0, 0]
-
-    for img_path in tqdm(sorted(img_paths)):
-        a = time.time()
-        img_path = str(img_path)
-        img_cv2 = cv2.imread(str(img_path))
-        # if 'c5_' not in img_path:
-        #     print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-        #     img_cv2 = cv2.imread(str(img_path))
-        # else:
-        #     print("?????????????????????????????????????????????????????????????????????????????????????????????????????????????????")
-        #     img_cv2 = cv2.cvtColor(cv2.imread(str(img_path)), cv2.COLOR_RGB2BGR)
-
-        results_dict[img_path] = {}
-        results_dict[img_path]['mano'] = []
-        results_dict[img_path]['cam_trans'] = []
-        results_dict[img_path]['tracked_ids'] = []
-        results_dict[img_path]['tracked_time'] = []
-        results_dict[img_path]['extra_data'] = []
-        # if '000009' not in str(img_path) and '000008' not in str(img_path):
-        #     continue
-
-        # Detect humans in image
-        det_out = detector(img_cv2)
-        img = img_cv2.copy()[:, :, ::-1]
-
-        det_instances = det_out['instances']
-        valid_idx = (det_instances.pred_classes == 0) & (
-            det_instances.scores > 0.5)
-        pred_bboxes = det_instances.pred_boxes.tensor[valid_idx].cpu().numpy()
-        pred_scores = det_instances.scores[valid_idx].cpu().numpy()
-        # print(det_out.keys())
-        # print(';******************')
-        # print(det_instances)
-
-        # Detect human keypoints for each person
-        vitposes_out = cpm.predict_pose(
-            img_cv2,
-            [np.concatenate([pred_bboxes, pred_scores[:, None]], axis=1)],
-        )
-
-        # mediapipe
-        # vis = img_cv2.copy()
-        # left, right, vis = run_mediapipe(img_cv2.copy(), vis)
-        # print(left, right, vis.shape)
-        # cv2.imwrite(f'./{x}.jpg', vis)
-        # x += 1
-
+    
+    for frame_data in tqdm(raw_data, desc="Pass 3: Running HaMeR"):
+        img_path = frame_data['img_path']
+        frame_idx = frame_data['frame_idx']
+        img_cv2 = cv2.imread(img_path)
+        img_fn = os.path.splitext(os.path.basename(img_path))[0]
+        
+        # Prepare bboxes
         bboxes = []
         is_right = []
         vit_keypoints_list = []
-        conf_list = []
-
-        # Use hands based on hand keypoint detections
-        last_left_conf = None
-        last_right_conf = None
-        l_flag = False
-        r_flag = False
-        img_fn, _ = os.path.splitext(os.path.basename(img_path))
-        # conf_list = []
-        # for index, vitposes in enumerate(vitposes_out):
-        #     left_conf = np.mean(vitposes['keypoints'][-42:-21][:,2]) * sum(vitposes['keypoints'][-42:-21][:,2] > 0.5)
-        #     right_conf = np.mean(vitposes['keypoints'][-21:][:,2]) * sum(vitposes['keypoints'][-21:][:,2] > 0.5)
-        #     print(np.mean(vitposes['keypoints'][-42:-21][:,2]), sum(vitposes['keypoints'][-42:-21][:,2] > 0.5))
-        #     print(np.mean(vitposes['keypoints'][-21:][:,2]), sum(vitposes['keypoints'][-21:][:,2] > 0.5))
-        #     total_conf = left_conf + right_conf
-        #     print(total_conf, left_conf, right_conf)
-        #     print('*-****')
-        #     conf_list.append(total_conf)
-
-        # vitposes_out = [vitposes_out[np.argsort(conf_list)[-1]]]
-        # print(conf_list, np.argsort(conf_list), 'selected: ', conf_list[np.argsort(conf_list)[-1]])
-
-        X = 0
-        # # option 2.
-        # for index, vitposes in enumerate(vitposes_out):
-        #     # print(vitposes.keys()) # dict_keys(['bbox', 'keypoints'])
-        #     left_hand_keyp = vitposes['keypoints'][-42:-21]
-        #     right_hand_keyp = vitposes['keypoints'][-21:]
-
-        #     # Rejecting not confident detections
-        #     keyp = left_hand_keyp
-        #     valid = keyp[:,2] > 0.5
-        #     if sum(valid) > 5:
-        #         print('append left')
-        #         bbox = [keyp[valid,0].min(), keyp[valid,1].min(), keyp[valid,0].max(), keyp[valid,1].max()]
-        #         # bboxes.append(bbox)
-        #         is_right.append(0)
-        #         # vit_keypoints_list.append(keyp)
-        #         l_bbox = bbox
-        #         l_keyp = keyp
-        #         last_left_conf = np.mean(keyp[:,2])
-        #         l_flag = True
-
-        #     keyp = right_hand_keyp
-        #     valid = keyp[:,2] > 0.5
-        #     if sum(valid) > 5:
-        #         print('append right')
-        #         bbox = [keyp[valid,0].min(), keyp[valid,1].min(), keyp[valid,0].max(), keyp[valid,1].max()]
-        #         # bboxes.append(bbox)
-        #         is_right.append(1)
-        #         # vit_keypoints_list.append(keyp)
-        #         r_bbox = bbox
-        #         r_keyp = keyp
-        #         last_right_conf = np.mean(keyp[:,2])
-        #         r_flag = True
-
-        #     X += 1
-        # assert X == 1
-
-        # option 1.
-        print("person number: ", len(vitposes_out))
-        for index, vitposes in enumerate(vitposes_out):
-            # print(vitposes.keys()) # dict_keys(['bbox', 'keypoints'])
-            left_hand_keyp = vitposes['keypoints'][-42:-21]
-            right_hand_keyp = vitposes['keypoints'][-21:]
-            # all_vit_2d = np.stack((left_hand_keyp, right_hand_keyp))
-            # print(all_vit_2d.shape)
-            # vit_img = img_cv2.copy()[:,:,::-1] * 255
-            # for i in range(len(all_vit_2d)):
-            #     body_keypoints_2d = all_vit_2d[i, :21].copy()
-            #     for op, gt in zip(openpose_indices, gt_indices):
-            #         if all_vit_2d[i, gt, -1] > body_keypoints_2d[op, -1]:
-            #             body_keypoints_2d[op] = all_vit_2d[i, gt]
-            #     vit_img = render_openpose(vit_img, body_keypoints_2d)
-            #     vit_img = vit_img.astype(np.uint8)
-
-            # cv2.imwrite(f'{img_fn}_{index}.jpg', vit_img[:, :, ::-1])
-
-            # Rejecting not confident detections
-            keyp = left_hand_keyp
-            valid = keyp[:, 2] > 0.5
-            if sum(valid) > 10:
-                if 0 not in is_right:
-                    print('append left')
-                    bbox = [keyp[valid, 0].min(), keyp[valid, 1].min(),
-                            keyp[valid, 0].max(), keyp[valid, 1].max()]
-                    # bboxes.append(bbox)
-                    is_right.append(0)
-                    # vit_keypoints_list.append(keyp)
-                    l_bbox = bbox
-                    l_keyp = keyp
-                    last_left_conf = np.mean(keyp[:, 2])
-                    l_flag = True
-                else:
-                    if np.mean(keyp[:, 2]) > last_left_conf:
-                        print('exchange!!!!!: ', np.mean(
-                            keyp[:, 2]), last_left_conf)
-                        # raise ValueError
-                        last_left_conf = np.mean(keyp[:, 2])
-                        l_bbox = bbox
-                        l_keyp = keyp
-
-            keyp = right_hand_keyp
-            valid = keyp[:, 2] > 0.5
-            if sum(valid) > 10:
-                if 1 not in is_right:
-                    print('append right')
-                    bbox = [keyp[valid, 0].min(), keyp[valid, 1].min(),
-                            keyp[valid, 0].max(), keyp[valid, 1].max()]
-                    # bboxes.append(bbox)
-                    is_right.append(1)
-                    # vit_keypoints_list.append(keyp)
-                    r_bbox = bbox
-                    r_keyp = keyp
-                    last_right_conf = np.mean(keyp[:, 2])
-                    r_flag = True
-                else:
-                    if np.mean(keyp[:, 2]) > last_right_conf:
-                        print('exchange!!!!!: ', np.mean(
-                            keyp[:, 2]), last_right_conf)
-                        # raise ValueError
-                        last_right_conf = np.mean(keyp[:, 2])
-                        r_bbox = bbox
-                        r_keyp = keyp
-
-        is_right = []
-        if l_flag:
-            bboxes.append(l_bbox)
+        
+        if frame_data['left_bbox'] is not None:
+            bboxes.append(frame_data['left_bbox'])
             is_right.append(0)
-            vit_keypoints_list.append(l_keyp)
-
-        if r_flag:
-            bboxes.append(r_bbox)
+            vit_keypoints_list.append(frame_data['left_keypoints'])
+        
+        if frame_data['right_bbox'] is not None:
+            bboxes.append(frame_data['right_bbox'])
             is_right.append(1)
-            vit_keypoints_list.append(r_keyp)
-
+            vit_keypoints_list.append(frame_data['right_keypoints'])
+        
         if len(bboxes) == 0:
-            results_dict[img_path]['tid'] = tid
-            results_dict[img_path]['tracked_time'] = []
-            results_dict[img_path]['shot'] = 0
-            tracked_time[0] += 1
-            tracked_time[1] += 1
-            for i in tid:
-                results_dict[img_path]['tracked_time'].append(tracked_time[i])
-            for idx, i in enumerate(tracked_time):
-                if i > 50 and (idx in tid):
-                    tid.remove(idx)
-            print('no hand detected!!!', results_dict[img_path]['tid'],
-                  results_dict[img_path]['tracked_ids'], results_dict[img_path]['tracked_time'])
+            results_dict[img_path] = {
+                'mano': [],
+                'cam_trans': [],
+                'tracked_ids': [],
+                'tracked_time': [],
+                'extra_data': [],
+                'tid': np.array([]),
+                'shot': 0
+            }
             continue
+        
+        boxes = np.array(bboxes)
+        right = np.array(is_right)
+        
+        # Validate and fix keypoints (create dummy keypoints if None)
+        fixed_keypoints_list = []
+        for i, kp in enumerate(vit_keypoints_list):
+            if kp is None:
+                # Create dummy keypoints with 0.5 confidence
+                dummy_keypoints = np.zeros((21, 3))
+                dummy_keypoints[:, 2] = 0.5
+                fixed_keypoints_list.append(dummy_keypoints)
+            elif not isinstance(kp, np.ndarray):
+                raise ValueError(f"Frame {frame_idx} ({img_fn}): keypoints are not numpy array for hand {i}, got {type(kp)}")
+            elif kp.shape != (21, 3):
+                raise ValueError(f"Frame {frame_idx} ({img_fn}): keypoints have wrong shape {kp.shape} for hand {i}, expected (21, 3)")
+            else:
+                fixed_keypoints_list.append(kp)
+        
+        vit_keypoints = np.stack(fixed_keypoints_list, axis=0)
+        
+        # Create dataset
+        dataset = ViTDetDataset(model_cfg, img_cv2, boxes, right, vit_keypoints, rescale_factor=args.rescale_factor)
+        dataloader = torch.utils.data.DataLoader(dataset, batch_size=8, shuffle=False, num_workers=0)
 
-        if len(bboxes) > 0:
-            boxes = np.stack(bboxes)
-            right = np.stack(is_right)
-            vit_keypoints = np.stack(vit_keypoints_list)
-
-            sort_idx = np.argsort(right)
-            print('sort_idx', sort_idx, right)
-            right = right[sort_idx][:2]
-            print('right: ', right)
-            vit_keypoints = vit_keypoints[sort_idx][:2]
-            boxes = boxes[sort_idx][:2]
-        else:
-            raise ValueError
-
-        # if len(left_hand_keyp_list) > 0:
-        #     l_vit_keypoints = np.stack(left_hand_keyp_list)
-        # else:
-        #     l_vit_keypoints = np.zeros((1, 21, 3))
-        # if len(right_hand_keyp_list) > 0:
-        #     r_vit_keypoints = np.stack(right_hand_keyp_list)
-        # else:
-        #     r_vit_keypoints = np.zeros((1, 21, 3))
-        # print('raw vit results:', l_vit_keypoints.shape, r_vit_keypoints.shape)
-
-        # Run reconstruction on all detected hands
-        print(right)
-        assert (right == [0, 1]).all() or (
-            right == [0]).all() or (right == [1]).all()
-
-        ####################################
-
-        # print(boxes.shape, right.shape, vit_keypoints.shape)
-        # raise ValueError
-        # boxes, right, vit_keypoints = restrict_hand_movement(boxes, right, vit_keypoints)
-
-        dataset = ViTDetDataset(model_cfg, img_cv2, boxes, right,
-                                vit_keypoints, rescale_factor=args.rescale_factor)
-        dataloader = torch.utils.data.DataLoader(
-            dataset, batch_size=8, shuffle=False, num_workers=0)
-
+        # Run HaMeR
         all_verts = []
         all_cam_t = []
-        all_joints = []
-        all_pred_3d = []
         all_right = []
-        all_vit_2d = []
+        all_mano_params = []
         all_pred_2d = []
         all_bboxes = []
 
-        left_flag = False
-        right_flag = False
-        b = time.time()
-        print('vit time:', b-a)
+        # Get image size for rendering
+        img_h, img_w = img_cv2.shape[:2]
+        render_res = [img_w, img_h]  # renderer expects [width, height]
+
         for batch in dataloader:
             batch = recursive_to(batch, device)
             with torch.no_grad():
                 out = model(batch)
-
-            multiplier = (2*batch['right']-1)
+            
+            multiplier = (2 * batch['right'] - 1)
             pred_cam = out['pred_cam']
-            pred_cam[:, 1] = multiplier*pred_cam[:, 1]
+            pred_cam[:, 1] = multiplier * pred_cam[:, 1]
+            
             box_center = batch["box_center"].float()
             box_size = batch["box_size"].float()
             img_size = batch["img_size"].float()
-            multiplier = (2*batch['right']-1)
-            scaled_focal_length = model_cfg.EXTRA.FOCAL_LENGTH / \
-                model_cfg.MODEL.IMAGE_SIZE * img_size.max()
-            # print(scaled_focal_length, model_cfg.EXTRA.FOCAL_LENGTH, model_cfg.MODEL.IMAGE_SIZE, img_size.max())
-            pred_cam_t_full = cam_crop_to_full(
-                pred_cam, box_center, box_size, img_size, scaled_focal_length)  # .detach().cpu().numpy()
-
-            # Render the result
+            batch_scaled_focal_length = model_cfg.EXTRA.FOCAL_LENGTH / model_cfg.MODEL.IMAGE_SIZE * img_size.max()
+            
+            # Compute camera translation (SLAHMR-style)
             batch_size = batch['img'].shape[0]
-            # d3 = out['pred_keypoints_3d'].reshape(batch_size, -1, 3)
-            # out['pred_keypoints_2d'] = perspective_projection(d3,
-            #                             translation=pred_cam_t_full.reshape(batch_size, 3),
-            #                             focal_length=out['focal_length'].reshape(-1, 2) / model_cfg.MODEL.IMAGE_SIZE)
-
-            pred_cam_t_full = pred_cam_t_full.detach().cpu().numpy()
-
-            # print('batch_size: ', batch_size)
+            pred_cam_t_full = torch.zeros(batch_size, 3, device=pred_cam.device)
+            
             for n in range(batch_size):
-                # Get filename from path img_path
-                img_fn, _ = os.path.splitext(os.path.basename(img_path))
-                person_id = int(batch['personid'][n])
-                white_img = (torch.ones_like(batch['img'][n]).cpu(
-                ) - DEFAULT_MEAN[:, None, None]/255) / (DEFAULT_STD[:, None, None]/255)
-                input_patch = batch['img'][n].cpu(
-                ) * (DEFAULT_STD[:, None, None]/255) + (DEFAULT_MEAN[:, None, None]/255)
-                input_patch = input_patch.permute(1, 2, 0).numpy()
+                cam = pred_cam[n]
+                H, W = img_size[n, 1], img_size[n, 0]
+                focal = batch_scaled_focal_length[n] if batch_scaled_focal_length.ndim > 0 else batch_scaled_focal_length
+                cx, cy = box_center[n]
+                scale = box_size[n]
 
-                # Add all verts and cams to list
+                tz = 2 * focal / (scale * cam[0] + 1e-6)
+                tx = cam[1] + tz / focal * (cx - W / 2)
+                ty = cam[2] + tz / focal * (cy - H / 2)
+
+                pred_cam_t_full[n] = torch.tensor([tx, ty, tz], device=pred_cam.device)
+            
+            pred_cam_t_full = pred_cam_t_full.detach().cpu().numpy()
+            
+            for n in range(batch_size):
                 verts = out['pred_vertices'][n].detach().cpu().numpy()
-                pred_joints = out['pred_keypoints_2d'][n].detach(
-                ).cpu().numpy()
-                pred_3d = out['pred_keypoints_3d'][n].detach().cpu().numpy()
-
-                is_right = int(batch['right'][n].cpu().numpy())
-                if 'EgoPAT3D' == args.type and is_right == 0:
-                    print('stip left hand for EgoPAT3D')
-                    continue
-                # if 'HOI4D' == args.type and is_right == 0:
-                #     print('stip left hand for HOI4D')
-                #     continue
-                # if 'FPHA' == args.type and is_right == 0:
-                #     print('stip left hand for FPHA')
-                #     continue
-                if 'EgoDexter' == args.type and is_right == 1:
-                    print('skip right hand for EgoDexter')
-                    continue
-
-                # print("args.type: ", args.type, is_right)
-                # raise ValueError
-
-                if is_right == 1:
-                    if not right_flag:
-                        right_flag = True
-                    else:
-                        continue
-                else:
-                    if not left_flag:
-                        left_flag = True
-                    else:
-                        continue
-
-                pred_joints[:, 0] = (2*is_right-1)*pred_joints[:, 0]
-                v = np.ones((21, 1))
-                pred_joints = np.concatenate((pred_joints, v), axis=-1)
-                verts[:, 0] = (2*is_right-1)*verts[:, 0]
-                pred_3d[:, 0] = (2*is_right-1)*pred_3d[:, 0]
+                pred_joints = out['pred_keypoints_2d'][n].detach().cpu().numpy()
+                is_right_val = int(batch['right'][n].cpu().numpy())
+                verts[:, 0] = (2 * is_right_val - 1) * verts[:, 0]
+                pred_joints[:, 0] = (2 * is_right_val - 1) * pred_joints[:, 0]
                 cam_t = pred_cam_t_full[n]
-                # print('cam_t.shape', cam_t.shape)
-
-                all_pred_3d.append(pred_3d)
-                all_joints.append(pred_joints)
+                
                 all_verts.append(verts)
                 all_cam_t.append(cam_t)
-                all_right.append(is_right)
+                all_right.append(is_right_val)
                 all_pred_2d.append(pred_joints)
-                all_vit_2d.append(batch['2d'][n])
                 all_bboxes.append(batch['bbox'][n].detach().cpu().numpy())
-
-                tracked_time[is_right] = 0
-                results_dict[img_path]['tracked_ids'].append(is_right)
-                if is_right not in tid:
-                    tid.append(is_right)
-
-                out['pred_mano_params'][n]['is_right'] = is_right
-                results_dict[img_path]['mano'].append(
-                    out['pred_mano_params'][n])
-                results_dict[img_path]['cam_trans'].append(cam_t)
-                # if len(all_joints) == 180:
-                #     break
-
-        big_all_joints.append(all_pred_3d)
-        big_all_verts.append(all_verts)
-        big_all_cam_t.append(all_cam_t)
-        big_all_right.append(all_right)
-
-        assert len(results_dict[img_path]['tracked_ids']) <= 2
-        if len(results_dict[img_path]['tracked_ids']) == 1:
-            # if is_right == 0, left hand presents
-            if results_dict[img_path]['tracked_ids'][0] == 0:
-                tracked_time[1] += 1  # then right hand time + 1
-            else:
-                tracked_time[0] += 1
-
-        tid = sorted(tid)
-        for idx, i in enumerate(tracked_time):
-            if i > 50 and (idx in tid):
-                tid.remove(idx)
-
-        results_dict[img_path]['shot'] = 0
-        results_dict[img_path]['tracked_time'] = []
-        for i in tid:
-            results_dict[img_path]['tracked_time'].append(tracked_time[i])
-
-        results_dict[img_path]['tid'] = np.array(tid)
-        print('tid/tracked_ids/tracked_time', results_dict[img_path]['tid'],
-              results_dict[img_path]['tracked_ids'], results_dict[img_path]['tracked_time'])
-
-        if args.full_frame and len(all_verts) > 0:
-            # Render front view
-            assert len(all_vit_2d) == len(all_pred_2d)
-            assert len(all_verts) == 2 or len(
-                all_verts) == 1, f'{len(all_verts)}'
-            print('length: ', len(all_vit_2d), len(all_pred_2d))
-            all_vit_2d = torch.stack(all_vit_2d).cpu().numpy()
-            all_pred_2d = np.stack(all_pred_2d)
-            all_bboxes = np.stack(all_bboxes)
-            # print('vit_2d: ', all_vit_2d.shape)
-            print('pred_2d: ', all_pred_2d.shape)
-            print('all_bboxes: ', all_bboxes.shape)
-            all_pred_2d = model_cfg.MODEL.IMAGE_SIZE * (all_pred_2d + 0.5)
-            all_pred_2d = convert_crop_coords_to_orig_img(
-                bbox=all_bboxes, keypoints=all_pred_2d, crop_size=model_cfg.MODEL.IMAGE_SIZE)
-            assert len(all_pred_2d.shape) == 3
-            assert all_pred_2d.shape[-1] == 3
-            all_pred_2d[:, :, -1] = 1
-            results_dict[img_path]['extra_data'] = []
-            for i in range(len(all_pred_2d)):
-                results_dict[img_path]['extra_data'].append(
-                    all_pred_2d[i].tolist())
-
-            if args.render:
-                misc_args = dict(
-                    mesh_base_color=LIGHT_BLUE,
-                    scene_bg_color=(1, 1, 1),
-                    focal_length=scaled_focal_length,
-                )
-                # print(all_cam_t)
-                cam_view, multi_depth = renderer.render_rgba_multiple(
-                    all_verts, cam_t=all_cam_t, render_res=img_size[n], is_right=all_right, **misc_args)
-
-                # Overlay image
-                input_img = img_cv2.astype(np.float32)[:, :, ::-1]/255.0
-                input_img = np.concatenate([input_img, np.ones_like(
-                    input_img[:, :, :1])], axis=2)  # Add alpha channel
-                input_img_overlay = input_img[:, :, :3] * (
-                    1-cam_view[:, :, 3:]) + cam_view[:, :, :3] * cam_view[:, :, 3:]
-
-                # Apply colormap to project depth into color
-                # alpha_channel = multi_depth.copy()
-                # colormap = cm.get_cmap('gray')
-                # multi_depth = (colormap(multi_depth)[:, :, :3] * 255).astype(np.uint8)
-                # multi_depth = np.dstack([multi_depth, (alpha_channel * 255).astype(np.uint8)])
-
-                # # save to .jpg
-                # plt.imsave('depth_visualization.jpg', depth_colored)
-                # depth_img_overlay = input_img[:,:,:3] * (1-multi_depth[:,:,3:]) + multi_depth[:,:,:3] * multi_depth[:,:,3:]
-
-                vit_img = input_img.copy()[:, :, ::-1] * 255
-                for i in range(len(all_verts)):
-                    body_keypoints_2d = all_vit_2d[i, :21].copy()
-                    for op, gt in zip(openpose_indices, gt_indices):
-                        if all_vit_2d[i, gt, -1] > body_keypoints_2d[op, -1]:
-                            body_keypoints_2d[op] = all_vit_2d[i, gt]
-                    vit_img = render_openpose(vit_img, body_keypoints_2d)
-                    cx, cy, h, w = all_bboxes[i]
-                    print('bbox: ', cx, cy, h, w, vit_img.shape)
-
-                    x1 = int(cx - w / 2)
-                    y1 = int(cy - h / 2)
-                    x2 = int(cx + w / 2)
-                    y2 = int(cy + h / 2)
-
-                    # print(pred_img.shape)
-                    vit_img = vit_img.astype(np.uint8)
-                    cv2.rectangle(vit_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-                # pred_img = batch['img_patch'][n].cpu().numpy().copy() # input_img.copy()[:,:,::-1] * 255
-                pred_img = input_img.copy()[:, :, :-1][:, :, ::-1] * 255
-                for i in range(len(all_verts)):
-                    body_keypoints_2d = all_pred_2d[i, :21].copy()
-                    for op, gt in zip(openpose_indices, gt_indices):
-                        if all_pred_2d[i, gt, -1] > body_keypoints_2d[op, -1]:
-                            body_keypoints_2d[op] = all_pred_2d[i, gt]
-                            raise ValueError
-                        else:
-                            pass
-
-                    assert (body_keypoints_2d == all_pred_2d[i, :21]).all()
-                    pred_img = render_openpose(pred_img, body_keypoints_2d)
-
-                # draw 2d keypoints
-                cv2.imwrite(os.path.join(render_save_path,
-                            f'{img_fn}.jpg'), 255*input_img_overlay[:, :, ::-1])
-                cv2.imwrite(os.path.join(joint2d_save_path,
-                            f'{img_fn}.jpg'), pred_img[:, :, ::-1])
-                cv2.imwrite(os.path.join(vit_save_path,
-                            f'{img_fn}.jpg'), vit_img[:, :, ::-1])
-
-        c = time.time()
-        print('one step time: ', c - a, 'hamer time: ', c-b)
-
-    # Save all meshes to disk
-    # print(big_all_cam_t)
-    # print(len(big_all_cam_t), len(big_all_cam_t[0]), len(big_all_cam_t[0][0]))
-    if len(big_all_joints[0]) == 1:
-        init_trans = big_all_cam_t[0][0].copy() + big_all_joints[0][0][9]
-    else:
-        x = (big_all_cam_t[0][0] + big_all_joints[0][0][9] +
-             big_all_cam_t[0][1] + big_all_joints[0][1][9]) / 2
-        init_trans = big_all_cam_t[0][0].copy()
-
-    # print(big_all_cam_t[0])
-    N = 0
-    for a, b, c, d in zip(big_all_verts, big_all_joints, big_all_cam_t, big_all_right):
-        for verts, joints, cam_t, is_right in zip(a, b, c, d):
-            if args.save_mesh:
-                camera_translation = cam_t.copy() - init_trans
-                # print(init_trans, cam_t, joints)
-                # exit()
-                tmesh = renderer.vertices_to_trimesh(
-                    verts, camera_translation, LIGHT_BLUE, is_right=is_right)
-                tmesh.export(os.path.join(
-                    mesh_dir, f'{str(N).zfill(6)}_{is_right}.obj'))
-        N += 1
-
-    if args.render:
-        if args.res_folder is not None:
-            save_video(render_save_path, os.path.dirname(
-                args.res_folder), args.out_folder)
-            save_video(joint2d_save_path, os.path.dirname(
-                args.res_folder), args.out_folder + '_2d')
-            save_video(vit_save_path, os.path.dirname(
-                args.res_folder), args.out_folder + '_vit')
+                
+                mano_params = out['pred_mano_params'][n]
+                mano_params['is_right'] = is_right_val
+                all_mano_params.append(mano_params)
+        
+        # Convert 2D keypoints to original image coordinates
+        if len(all_pred_2d) > 0:
+            all_pred_2d_np = np.stack(all_pred_2d)
+            all_bboxes_np = np.stack(all_bboxes)
+            
+            # Add confidence column
+            v = np.ones((all_pred_2d_np.shape[0], all_pred_2d_np.shape[1], 1))
+            all_pred_2d_np = np.concatenate((all_pred_2d_np, v), axis=-1)
+            
+            # Convert from crop coords to original image coords
+            all_pred_2d_np = model_cfg.MODEL.IMAGE_SIZE * (all_pred_2d_np + 0.5)
+            all_pred_2d_np = convert_crop_coords_to_orig_img(bbox=all_bboxes_np, keypoints=all_pred_2d_np, crop_size=model_cfg.MODEL.IMAGE_SIZE)
+            all_pred_2d_np[:, :, -1] = 1  # Set all confidences to 1
+            
+            extra_data = [all_pred_2d_np[i].tolist() for i in range(len(all_pred_2d_np))]
         else:
-            save_video(render_save_path, args.out_folder)
-            save_video(joint2d_save_path, args.out_folder + '_2d')
-            save_video(vit_save_path, args.out_folder + '_vit')
+            extra_data = []
+        
+        # Store results
+        results_dict[img_path] = {
+            'mano': all_mano_params,
+            'cam_trans': all_cam_t,
+            'tracked_ids': all_right,
+            'tracked_time': [0] * len(all_right),
+            'extra_data': extra_data,
+            'tid': np.array(all_right),
+            'shot': 0
+        }
+        
+        # Render hand meshes if requested
+        if args.render and len(all_verts) > 0 and renderer is not None:
+            LIGHT_BLUE = (0.65098039, 0.74117647, 0.85882353)
+            # Compute scaled focal length for rendering
+            render_focal_length = model_cfg.EXTRA.FOCAL_LENGTH / model_cfg.MODEL.IMAGE_SIZE * max(img_h, img_w)
+            misc_args = dict(
+                mesh_base_color=LIGHT_BLUE,
+                scene_bg_color=(1, 1, 1),
+                focal_length=render_focal_length,
+            )
 
-    # save_video(depth_save_path, 'dance_depth')
-    for i in results_dict.keys():
-        if len(results_dict[i]['tid']) > 1 and len(results_dict[i]['mano']) == 1:
-            # print(results_dict[i]['tid'])
-            assert (results_dict[i]['tid'] == [0, 1]).all()
-            if results_dict[i]['mano'][0]['is_right'] == 0:
-                continue
-            elif results_dict[i]['mano'][0]['is_right'] == 1:
-                results_dict[i]['mano'].insert(0, -100)
-                results_dict[i]['cam_trans'].insert(0, -100)
-                assert np.array(
-                    results_dict[i]['extra_data']).shape == (1, 21, 3)
-                d2 = results_dict[i]['extra_data'][0]
-                results_dict[i]['extra_data'] = [-100, d2]
-            # print(results_dict[i]['extra_data'])
+            cam_view = renderer.render_rgba_multiple(
+                all_verts,
+                cam_t=all_cam_t,
+                render_res=render_res,
+                is_right=all_right,
+                **misc_args
+            )
+            
+            # Overlay on original image
+            input_img = img_cv2.astype(np.float32)[:, :, ::-1] / 255.0
+            input_img = np.concatenate([input_img, np.ones_like(input_img[:, :, :1])], axis=2)
+            input_img_overlay = input_img[:, :, :3] * (1 - cam_view[:, :, 3:]) + cam_view[:, :, :3] * cam_view[:, :, 3:]
+            
+            # Save rendered result
+            render_path = os.path.join(os.path.dirname(args.res_folder), f'render_all_{model_cfg.EXTRA.FOCAL_LENGTH}')
+            os.makedirs(render_path, exist_ok=True)
+            cv2.imwrite(os.path.join(render_path, f'{img_fn}.jpg'), 255 * input_img_overlay[:, :, ::-1])
+    
+    # Create video from Pass 3 rendered results
+    render_path = os.path.join(os.path.dirname(args.res_folder), f'render_all_{model_cfg.EXTRA.FOCAL_LENGTH}')
+    if os.path.exists(render_path):
+        video_path = os.path.join(os.path.dirname(args.res_folder), f'render_all_{model_cfg.EXTRA.FOCAL_LENGTH}.mp4')
+        create_video_from_images(render_path, video_path, fps=30)
+    
+    print("\n" + "="*80)
+    print("PASS 3 Complete: HaMeR reconstruction finished")
+    print("="*80)
+    
+    return results_dict
 
-    print('save to ', os.path.dirname(args.res_folder), args.res_folder)
-    with open(args.res_folder, 'wb') as f:
-        pickle.dump(results_dict, f)
 
+# ============================================================================
+# Main
+# ============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(description='HaMeR with 3-pass architecture using YOLO hand detector')
+    parser.add_argument('--data_dir', type=str, required=True, help='Path to data directory containing HAMER checkpoint')
+    parser.add_argument('--checkpoint', type=str, default=None, help='Path to pretrained model checkpoint (default: uses data_dir)')
+    parser.add_argument('--img_folder', type=str, default='images', help='Folder with input images')
+    parser.add_argument('--out_folder', type=str, default='out_demo', help='Output folder to save rendered results')
+    parser.add_argument('--res_folder', type=str, required=True, help='Output pickle file path to save results')
+    parser.add_argument('--side_view', dest='side_view', action='store_true', default=False, help='If set, render side view also')
+    parser.add_argument('--full_frame', dest='full_frame', action='store_true', default=True, help='If set, render all people together also')
+    parser.add_argument('--save_mesh', dest='save_mesh', action='store_true', default=False, help='If set, save meshes to disk also')
+    parser.add_argument('--batch_size', type=int, default=1, help='Batch size for inference/fitting')
+    parser.add_argument('--rescale_factor', type=float, default=2.5, help='Factor for padding the bbox')
+    parser.add_argument('--file_type', nargs='+', default=['*.jpg', '*.png'], help='List of file extensions to consider')
+    parser.add_argument('--conf', type=float, default=2.0, help='Confidence threshold for detection')
+    parser.add_argument('--type', type=str, default='videos', help='Dataset type')
+    parser.add_argument('--render', dest='render', action='store_true', default=False, help='If set, render visualizations')
+    parser.add_argument('--yolo_model', type=str, default='./pretrained_models/detector.pt',
+                        help='Path to YOLO hand detector model')
+    parser.add_argument('--vitpose_dir', type=str, default=None, help='(Deprecated) ViTPose directory - not used in YOLO version')
+
+    args = parser.parse_args()
+
+    # Setup
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    img_folder = Path(args.img_folder)
+
+    # Get all images matching file_type patterns
+    img_paths = sorted([img for end in args.file_type for img in img_folder.glob(end)])
+
+    print(f"Found {len(img_paths)} images in {img_folder}")
+
+    # Load models
+    print("\nLoading models...")
+    # Use data_dir if checkpoint not specified
+    checkpoint_path = args.checkpoint if args.checkpoint is not None else args.data_dir
+    download_models(checkpoint_path)
+    model, model_cfg = load_hamer(checkpoint_path)
+    model = model.to(device)
+    model.eval()
+    
+    # Load YOLO hand detector (like WiLoR)
+    print(f"\nLoading YOLO hand detector: {args.yolo_model}")
+    # Monkey patch torch.load to disable weights_only for YOLO model loading (PyTorch 2.6+ compatibility)
+    # The detector.pt is a trusted model file
+    import torch as torch_module
+    _original_torch_load = torch_module.load
+    def _patched_torch_load(*args, **kwargs):
+        kwargs['weights_only'] = False
+        return _original_torch_load(*args, **kwargs)
+    torch_module.load = _patched_torch_load
+
+    yolo_detector = YOLO(args.yolo_model)
+    yolo_detector.to(device)
+
+    # Restore original torch.load
+    torch_module.load = _original_torch_load
+    
+    # Load renderer
+    renderer = Renderer(model_cfg, faces=model.mano.faces)
+    
+    # Create visualization directory
+    vis_dir = None
+    if args.render and args.res_folder is not None:
+        vis_dir = os.path.join(os.path.dirname(args.res_folder), f'bbox_vis_{model_cfg.EXTRA.FOCAL_LENGTH}')
+        os.makedirs(vis_dir, exist_ok=True)
+        print(f"\nBbox visualizations will be saved to: {vis_dir}")
+    
+    # PASS 1: Extract raw bboxes using YOLO
+    raw_data = extract_raw_bboxes(img_paths, yolo_detector, vis_dir=vis_dir)
+    
+    # PASS 2: Clean bbox sequences
+    cleaned_data = clean_bbox_sequences(raw_data, vis_dir=vis_dir)
+    
+    # PASS 3: Run HaMeR
+    results = run_hamer_on_cleaned_bboxes(cleaned_data, model, model_cfg, renderer, args)
+    
+    # Save results
+    output_path = Path(args.res_folder)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, 'wb') as f:
+        pickle.dump(results, f)
+    
+    print(f"\nResults saved to {output_path}")
 
 if __name__ == '__main__':
     main()
