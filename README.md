@@ -19,6 +19,8 @@ pip install git+https://github.com/facebookresearch/detectron2 --no-build-isolat
 
 pip install ultralytics==8.1.34
 
+pip install git+https://github.com/mattloper/chumpy --no-build-isolation
+
 pip install -e .
 ```
 

@@ -9,17 +9,18 @@ This uses YOLO hand detector (like WiLoR) instead of Detectron2 + ViTPose.
 
 from pathlib import Path
 import torch
-import argparse
 import os
 import sys
 import cv2
 import numpy as np
 import pickle
 from typing import Dict, List, Tuple, Optional
+from dataclasses import dataclass
 from tqdm import tqdm
 import json
 import time
 import imageio
+import tyro
 from hamer.configs import CACHE_DIR_HAMER
 from hamer.models import HAMER, download_models, load_hamer
 from hamer.utils import recursive_to
@@ -1255,27 +1256,45 @@ def run_hamer_on_cleaned_bboxes(raw_data, model, model_cfg, renderer, args):
 # Main
 # ============================================================================
 
-def main():
-    parser = argparse.ArgumentParser(description='HaMeR with 3-pass architecture using YOLO hand detector')
-    parser.add_argument('--data_dir', type=str, required=True, help='Path to data directory containing HAMER checkpoint')
-    parser.add_argument('--checkpoint', type=str, default=None, help='Path to pretrained model checkpoint (default: uses data_dir)')
-    parser.add_argument('--img_folder', type=str, default='images', help='Folder with input images')
-    parser.add_argument('--out_folder', type=str, default='out_demo', help='Output folder to save rendered results')
-    parser.add_argument('--res_folder', type=str, required=True, help='Output pickle file path to save results')
-    parser.add_argument('--side_view', dest='side_view', action='store_true', default=False, help='If set, render side view also')
-    parser.add_argument('--full_frame', dest='full_frame', action='store_true', default=True, help='If set, render all people together also')
-    parser.add_argument('--save_mesh', dest='save_mesh', action='store_true', default=False, help='If set, save meshes to disk also')
-    parser.add_argument('--batch_size', type=int, default=1, help='Batch size for inference/fitting')
-    parser.add_argument('--rescale_factor', type=float, default=2.5, help='Factor for padding the bbox')
-    parser.add_argument('--file_type', nargs='+', default=['*.jpg', '*.png'], help='List of file extensions to consider')
-    parser.add_argument('--conf', type=float, default=2.0, help='Confidence threshold for detection')
-    parser.add_argument('--type', type=str, default='videos', help='Dataset type')
-    parser.add_argument('--render', dest='render', action='store_true', default=False, help='If set, render visualizations')
-    parser.add_argument('--yolo_model', type=str, default='./pretrained_models/detector.pt',
-                        help='Path to YOLO hand detector model')
-    parser.add_argument('--vitpose_dir', type=str, default=None, help='(Deprecated) ViTPose directory - not used in YOLO version')
+@dataclass
+class Args:
+    """HaMeR with 3-pass architecture using YOLO hand detector"""
+    data_dir: str
+    """Path to data directory containing HAMER checkpoint"""
+    res_folder: str
+    """Output pickle file path to save results"""
+    img_folder: str = 'images'
+    """Folder with input images"""
+    out_folder: str = 'out_demo'
+    """Output folder to save rendered results"""
+    side_view: bool = False
+    """If set, render side view also"""
+    full_frame: bool = True
+    """If set, render all people together also"""
+    save_mesh: bool = False
+    """If set, save meshes to disk also"""
+    batch_size: int = 1
+    """Batch size for inference/fitting"""
+    rescale_factor: float = 2.5
+    """Factor for padding the bbox"""
+    file_type: List[str] = None
+    """List of file extensions to consider"""
+    conf: float = 2.0
+    """Confidence threshold for detection"""
+    type: str = 'videos'
+    """Dataset type"""
+    render: bool = False
+    """If set, render visualizations"""
+    vitpose_dir: Optional[str] = None
+    """(Deprecated) ViTPose directory - not used in YOLO version"""
+    
+    def __post_init__(self):
+        if self.file_type is None:
+            self.file_type = ['*.jpg', '*.png']
 
-    args = parser.parse_args()
+
+def main():
+    args = tyro.cli(Args)
 
     # Setup
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
@@ -1288,15 +1307,14 @@ def main():
 
     # Load models
     print("\nLoading models...")
-    # Use data_dir if checkpoint not specified
-    checkpoint_path = args.checkpoint if args.checkpoint is not None else args.data_dir
-    download_models(checkpoint_path)
-    model, model_cfg = load_hamer(checkpoint_path)
+    download_models(args.data_dir)
+    model, model_cfg = load_hamer(args.data_dir)
     model = model.to(device)
     model.eval()
     
     # Load YOLO hand detector (like WiLoR)
-    print(f"\nLoading YOLO hand detector: {args.yolo_model}")
+    yolo_model_path = os.path.join(args.data_dir, 'pretrained_models', 'detector.pt')
+    print(f"\nLoading YOLO hand detector: {yolo_model_path}")
     # Monkey patch torch.load to disable weights_only for YOLO model loading (PyTorch 2.6+ compatibility)
     # The detector.pt is a trusted model file
     import torch as torch_module
@@ -1306,7 +1324,7 @@ def main():
         return _original_torch_load(*args, **kwargs)
     torch_module.load = _patched_torch_load
 
-    yolo_detector = YOLO(args.yolo_model)
+    yolo_detector = YOLO(yolo_model_path)
     yolo_detector.to(device)
 
     # Restore original torch.load

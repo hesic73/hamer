@@ -13,23 +13,13 @@ setup(
         'pytorch-lightning',
         'scikit-image',
         'smplx==0.1.28',
-        'torch',
-        'torchvision',
         'yacs',
-        # 'detectron2 @ git+https://github.com/facebookresearch/detectron2',  # Install separately
         'mmcv==1.3.9',
         'timm',
         'einops',
         'pandas',
+        'imageio[ffmpeg]',
+        'webdataset',
+        'tyro',
     ],
-    extras_require={
-        'all': [
-            'hydra-core',
-            'hydra-submitit-launcher',
-            'hydra-colorlog',
-            'pyrootutils',
-            'rich',
-            'webdataset',
-        ],
-    },
 )
