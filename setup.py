@@ -21,5 +21,6 @@ setup(
         'imageio[ffmpeg]',
         'webdataset',
         'tyro',
+        'loguru',
     ],
 )

@@ -21,6 +21,7 @@ import json
 import time
 import imageio
 import tyro
+from loguru import logger
 from hamer.configs import CACHE_DIR_HAMER
 from hamer.models import HAMER, download_models, load_hamer
 from hamer.utils import recursive_to
@@ -77,16 +78,16 @@ def create_video_from_images(image_folder, output_video_path, fps=30):
     """Create MP4 video from images in a folder using imageio (same as src_cam video)."""
     image_folder = Path(image_folder)
     if not image_folder.exists():
-        print(f"Warning: {image_folder} does not exist, skipping video creation")
+        logger.warning(f"{image_folder} does not exist, skipping video creation")
         return
     
     # Get all jpg images sorted by filename
     image_files = sorted(list(image_folder.glob('*.jpg')))
     if len(image_files) == 0:
-        print(f"Warning: No images found in {image_folder}, skipping video creation")
+        logger.warning(f"No images found in {image_folder}, skipping video creation")
         return
     
-    print(f"Creating video: {output_video_path}")
+    logger.info(f"Creating video: {output_video_path}")
     
     # Load all images
     frames = []
@@ -96,12 +97,12 @@ def create_video_from_images(image_folder, output_video_path, fps=30):
             frames.append(img)
     
     if len(frames) == 0:
-        print(f"Warning: Could not load any images from {image_folder}")
+        logger.warning(f"Could not load any images from {image_folder}")
         return
     
     # Write video using imageio (same method as src_cam video generation)
     imageio.mimwrite(str(output_video_path), frames, fps=fps)
-    print(f"  Video saved: {output_video_path} ({len(frames)} frames @ {fps} fps)")
+    logger.info(f"Video saved: {output_video_path} ({len(frames)} frames @ {fps} fps)")
 
 
 # ============================================================================
@@ -122,9 +123,9 @@ def extract_raw_bboxes(img_paths, detector, vis_dir=None):
     Returns:
         raw_data: List of dicts for each frame with bbox data (no keypoints from YOLO)
     """
-    print("\n" + "="*80)
-    print("PASS 1: Extracting raw hand bboxes (YOLO hand detector)")
-    print("="*80)
+    logger.info("="*80)
+    logger.info("PASS 1: Extracting raw hand bboxes (YOLO hand detector)")
+    logger.info("="*80)
     
     if vis_dir is not None:
         pass1_dir = os.path.join(vis_dir, 'pass1_raw_bboxes')
@@ -230,25 +231,25 @@ def extract_raw_bboxes(img_paths, detector, vis_dir=None):
     missing_left = [i for i, f in enumerate(raw_data) if f['left_bbox'] is None]
     missing_right = [i for i, f in enumerate(raw_data) if f['right_bbox'] is None]
     
-    print(f"\nExtracted bboxes for {len(raw_data)} frames:")
-    print(f"  Left hand detected in {left_count} frames ({100*left_count/len(raw_data):.1f}%)")
-    print(f"  Right hand detected in {right_count} frames ({100*right_count/len(raw_data):.1f}%)")
+    logger.info(f"Extracted bboxes for {len(raw_data)} frames:")
+    logger.info(f"  Left hand detected in {left_count} frames ({100*left_count/len(raw_data):.1f}%)")
+    logger.info(f"  Right hand detected in {right_count} frames ({100*right_count/len(raw_data):.1f}%)")
     
     if len(missing_left) > 0:
-        print(f"  Missing left hand in {len(missing_left)} frames")
+        logger.info(f"  Missing left hand in {len(missing_left)} frames")
         if len(missing_left) <= 20:
-            print(f"    Frame indices: {missing_left}")
+            logger.info(f"    Frame indices: {missing_left}")
         else:
-            print(f"    First 10: {missing_left[:10]}")
-            print(f"    Last 10: {missing_left[-10:]}")
+            logger.info(f"    First 10: {missing_left[:10]}")
+            logger.info(f"    Last 10: {missing_left[-10:]}")
     
     if len(missing_right) > 0:
-        print(f"  Missing right hand in {len(missing_right)} frames")
+        logger.info(f"  Missing right hand in {len(missing_right)} frames")
         if len(missing_right) <= 20:
-            print(f"    Frame indices: {missing_right}")
+            logger.info(f"    Frame indices: {missing_right}")
         else:
-            print(f"    First 10: {missing_right[:10]}")
-            print(f"    Last 10: {missing_right[-10:]}")
+            logger.info(f"    First 10: {missing_right[:10]}")
+            logger.info(f"    Last 10: {missing_right[-10:]}")
     
     # Create video from Pass 1 visualizations
     if vis_dir is not None:
@@ -276,7 +277,7 @@ def detect_overlapping_bboxes(raw_data, iou_threshold=0.7, containment_threshold
     Also tracks which hand was removed due to overlap and which hand "caused" the removal,
     so we can potentially restore the removed hand if the winner is later invalidated.
     """
-    print("\nStep 1: Detecting overlapping bboxes")
+    logger.info("Step 1: Detecting overlapping bboxes")
     
     overlap_count = 0
     
@@ -308,23 +309,23 @@ def detect_overlapping_bboxes(raw_data, iou_threshold=0.7, containment_threshold
             
             if is_overlap:
                 overlap_count += 1
-                print(f"  Frame {frame_data['frame_idx']:04d}: {', '.join(reason)} - OVERLAP DETECTED")
+                logger.debug(f"Frame {frame_data['frame_idx']:04d}: {', '.join(reason)} - OVERLAP DETECTED")
                 
                 # Keep hand with higher confidence, track which hand was removed and why
                 if frame_data['left_conf'] > frame_data['right_conf']:
-                    print(f"    → Keeping LEFT (conf={frame_data['left_conf']:.3f}), removing RIGHT")
+                    logger.debug(f"    → Keeping LEFT (conf={frame_data['left_conf']:.3f}), removing RIGHT")
                     frame_data['right_bbox'] = None
                     frame_data['right_keypoints'] = None
                     frame_data['right_conf'] = 0.0
                     frame_data['right_removed_due_to_overlap_with'] = 'left'
                 else:
-                    print(f"    → Keeping RIGHT (conf={frame_data['right_conf']:.3f}), removing LEFT")
+                    logger.debug(f"    → Keeping RIGHT (conf={frame_data['right_conf']:.3f}), removing LEFT")
                     frame_data['left_bbox'] = None
                     frame_data['left_keypoints'] = None
                     frame_data['left_conf'] = 0.0
                     frame_data['left_removed_due_to_overlap_with'] = 'right'
     
-    print(f"Removed overlapping bboxes in {overlap_count} frames")
+    logger.info(f"Removed overlapping bboxes in {overlap_count} frames")
     return raw_data
 
 
@@ -336,7 +337,7 @@ def fix_handedness_swaps_by_trajectory(raw_data, position_threshold=200):
     Example: Green curve (right) drops to blue curve's position while blue disappears
     → The "right" detection is actually the left hand with wrong label
     """
-    print("\nStep 2: Detecting handedness swaps via trajectory")
+    logger.info("Step 2: Detecting handedness swaps via trajectory")
     
     swap_count = 0
     n = len(raw_data)
@@ -360,7 +361,7 @@ def fix_handedness_swaps_by_trajectory(raw_data, position_threshold=200):
             
             # If current "right" is much closer to previous left than previous right, it's swapped
             if dist_to_prev_left < dist_to_prev_right and dist_to_prev_right > position_threshold:
-                print(f"  Frame {i:04d}: RIGHT jumped to LEFT position (dist to prev_left={dist_to_prev_left:.0f}, dist to prev_right={dist_to_prev_right:.0f}) - Swapping RIGHT → LEFT")
+                logger.debug(f"Frame {i:04d}: RIGHT jumped to LEFT position (dist to prev_left={dist_to_prev_left:.0f}, dist to prev_right={dist_to_prev_right:.0f}) - Swapping RIGHT → LEFT")
                 raw_data[i]['left_bbox'] = right_bbox
                 raw_data[i]['left_keypoints'] = raw_data[i]['right_keypoints']
                 raw_data[i]['left_conf'] = raw_data[i]['right_conf']
@@ -382,7 +383,7 @@ def fix_handedness_swaps_by_trajectory(raw_data, position_threshold=200):
             
             # If current "left" is much closer to previous right than previous left, it's swapped
             if dist_to_prev_right < dist_to_prev_left and dist_to_prev_left > position_threshold:
-                print(f"  Frame {i:04d}: LEFT jumped to RIGHT position (dist to prev_right={dist_to_prev_right:.0f}, dist to prev_left={dist_to_prev_left:.0f}) - Swapping LEFT → RIGHT")
+                logger.debug(f"Frame {i:04d}: LEFT jumped to RIGHT position (dist to prev_right={dist_to_prev_right:.0f}, dist to prev_left={dist_to_prev_left:.0f}) - Swapping LEFT → RIGHT")
                 raw_data[i]['right_bbox'] = left_bbox
                 raw_data[i]['right_keypoints'] = raw_data[i]['left_keypoints']
                 raw_data[i]['right_conf'] = raw_data[i]['left_conf']
@@ -392,9 +393,9 @@ def fix_handedness_swaps_by_trajectory(raw_data, position_threshold=200):
                 swap_count += 1
     
     if swap_count > 0:
-        print(f"  Fixed {swap_count} trajectory-based handedness swaps")
+        logger.info(f"Fixed {swap_count} trajectory-based handedness swaps")
     else:
-        print(f"  No trajectory-based swaps detected")
+        logger.info(f"No trajectory-based swaps detected")
     
     return raw_data
 
@@ -417,7 +418,7 @@ def fix_handedness_swaps_frame_to_frame(raw_data, iou_threshold=0.7, max_gap=10)
     Args:
         max_gap: Maximum frames to look back for last valid other hand (default 10)
     """
-    print(f"\nStep 3: Detecting frame-to-frame handedness swaps (IoU={iou_threshold}, max_gap={max_gap})")
+    logger.info(f"Step 3: Detecting frame-to-frame handedness swaps (IoU={iou_threshold}, max_gap={max_gap})")
     
     swap_count = 0
     
@@ -449,13 +450,13 @@ def fix_handedness_swaps_frame_to_frame(raw_data, iou_threshold=0.7, max_gap=10)
                         break
                 
                 # If found a recent OTHER hand detection, check IoU
-                print(f"  Frame {curr['frame_idx']:04d}: {last_valid_other_bbox is not None}")
+                logger.debug(f"Frame {curr['frame_idx']:04d}: {last_valid_other_bbox is not None}")
                 if last_valid_other_bbox is not None:
                     gap = i - last_valid_other_idx
                     iou = compute_iou(curr_bbox, last_valid_other_bbox)
-                    print(f"  Frame {curr['frame_idx']:04d}: IoU = {iou:.3f}")
+                    logger.debug(f"Frame {curr['frame_idx']:04d}: IoU = {iou:.3f}")
                     if iou > iou_threshold:
-                        print(f"  Frame {curr['frame_idx']:04d}: {hand_name} at same position as {other_hand} "
+                        logger.debug(f"Frame {curr['frame_idx']:04d}: {hand_name} at same position as {other_hand} "
                               f"(last seen at frame {raw_data[last_valid_other_idx]['frame_idx']}, gap={gap}, IoU={iou:.3f}) "
                               f"- SWAPPING {hand_name} → {other_hand}")
                         
@@ -472,9 +473,9 @@ def fix_handedness_swaps_frame_to_frame(raw_data, iou_threshold=0.7, max_gap=10)
                         swap_count += 1
     
     if swap_count > 0:
-        print(f"  Fixed {swap_count} frame-to-frame handedness swaps")
+        logger.info(f"Fixed {swap_count} frame-to-frame handedness swaps")
     else:
-        print(f"  No frame-to-frame swaps detected")
+        logger.info(f"No frame-to-frame swaps detected")
     
     return raw_data
 
@@ -491,7 +492,7 @@ def fix_handedness_inconsistencies(raw_data, original_data, context_window=5):
     2. Also compute IoU with recent detections of OTHER hand
     3. If IoU with OTHER hand's trajectory is much higher → handedness is swapped!
     """
-    print(f"\nStep 4: Fixing handedness via spatial-temporal consistency (window={context_window})")
+    logger.info(f"Step 4: Fixing handedness via spatial-temporal consistency (window={context_window})")
     
     swap_count = 0
     
@@ -553,7 +554,7 @@ def fix_handedness_inconsistencies(raw_data, original_data, context_window=5):
                 avg_iou_other > 0.5 and 
                 avg_iou_other > avg_iou_same * 1.5):
                 
-                print(f"  Frame {frame_data['frame_idx']:04d} ({hand_name}): "
+                logger.debug(f"Frame {frame_data['frame_idx']:04d} ({hand_name}): "
                       f"Bbox fits {other_hand} trajectory better! "
                       f"(IoU with {hand_name}={avg_iou_same:.3f}, IoU with {other_hand}={avg_iou_other:.3f}, "
                       f"neighbors: {len(same_hand_bboxes)} {hand_name}, {len(other_hand_bboxes)} {other_hand}) "
@@ -572,9 +573,9 @@ def fix_handedness_inconsistencies(raw_data, original_data, context_window=5):
                 swap_count += 1
     
     if swap_count > 0:
-        print(f"  Fixed {swap_count} handedness swaps via spatial-temporal consistency")
+        logger.info(f"Fixed {swap_count} handedness swaps via spatial-temporal consistency")
     else:
-        print(f"  No spatial-temporal inconsistencies found")
+        logger.info(f"No spatial-temporal inconsistencies found")
     
     return raw_data
 
@@ -711,18 +712,18 @@ def plot_bbox_trajectories(raw_data, vis_dir, filename='bbox_trajectories.png'):
     save_path = os.path.join(vis_dir, filename)
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"\n{'='*80}")
-    print(f"Bbox trajectory plot saved to: {save_path}")
-    print(f"  Red regions indicate frames where left_x > right_x (potential label swaps)")
-    print(f"  Total frames with left_x > right_x: {swap_count}")
-    print(f"{'='*80}\n")
+    logger.info("="*80)
+    logger.info(f"Bbox trajectory plot saved to: {save_path}")
+    logger.info(f"Red regions indicate frames where left_x > right_x (potential label swaps)")
+    logger.info(f"Total frames with left_x > right_x: {swap_count}")
+    logger.info("="*80)
 
 
 def clean_bbox_sequences(raw_data, vis_dir=None):
     """Pass 2: Clean bbox sequences using global temporal information."""
-    print("\n" + "="*80)
-    print("PASS 2: Cleaning bbox sequences")
-    print("="*80)
+    logger.info("="*80)
+    logger.info("PASS 2: Cleaning bbox sequences")
+    logger.info("="*80)
     
     if vis_dir is not None:
         pass2_dir = os.path.join(vis_dir, 'pass2_cleaned_bboxes')
@@ -743,7 +744,7 @@ def clean_bbox_sequences(raw_data, vis_dir=None):
         plot_bbox_trajectories(raw_data, vis_dir, filename='bbox_trajectories_before_cleaning.png')
     
     # Remove oversized bboxes (> 50% of image area)
-    print("\nRemoving oversized bboxes (> 50% of image area)")
+    logger.info("Removing oversized bboxes (> 50% of image area)")
     MAX_BBOX_AREA_RATIO = 0.5
     removed_oversized = 0
     
@@ -765,7 +766,7 @@ def clean_bbox_sequences(raw_data, vis_dir=None):
                 area_ratio = bbox_area / img_area
                 
                 if area_ratio > MAX_BBOX_AREA_RATIO:
-                    print(f"  Frame {frame_data['frame_idx']:04d} ({hand_name}): "
+                    logger.debug(f"Frame {frame_data['frame_idx']:04d} ({hand_name}): "
                           f"Bbox too large ({area_ratio:.1%} of image) - REMOVING")
                     frame_data[bbox_key] = None
                     frame_data[keyp_key] = None
@@ -773,9 +774,9 @@ def clean_bbox_sequences(raw_data, vis_dir=None):
                     removed_oversized += 1
     
     if removed_oversized > 0:
-        print(f"  Removed {removed_oversized} oversized bboxes")
+        logger.info(f"Removed {removed_oversized} oversized bboxes")
     else:
-        print(f"  No oversized bboxes found")
+        logger.info(f"No oversized bboxes found")
     
     raw_data = detect_overlapping_bboxes(raw_data, iou_threshold=0.7)
     raw_data = fix_handedness_swaps_by_trajectory(raw_data, position_threshold=200)
@@ -783,7 +784,7 @@ def clean_bbox_sequences(raw_data, vis_dir=None):
     raw_data = fix_handedness_swaps_frame_to_frame(raw_data, iou_threshold=0.6)
     
     # Apply patience mechanism with interpolation when hand reappears
-    print("\nApplying patience mechanism with interpolation")
+    logger.info("Applying patience mechanism with interpolation")
     PATIENCE_FRAMES = 25
     MAX_PATIENCE_WITHOUT_RETURN = 0  # No padding if hand never reappears
     patience_applied_count = 0
@@ -842,7 +843,7 @@ def clean_bbox_sequences(raw_data, vis_dir=None):
                     
                     if center_distance <= max_distance:
                         # Bboxes are close - INTERPOLATE
-                        print(f"  {hand_name.capitalize()}: Interpolating frames {gap_start}-{gap_end-1} "
+                        logger.debug(f"{hand_name.capitalize()}: Interpolating frames {gap_start}-{gap_end-1} "
                               f"(gap={gap_length}, from frame {last_valid_idx} to {gap_end}, "
                               f"distance={center_distance:.1f}px < {max_distance:.1f}px)")
                         
@@ -866,7 +867,7 @@ def clean_bbox_sequences(raw_data, vis_dir=None):
                         i = gap_end
                     else:
                         # Bboxes are too far apart - DON'T interpolate, treat as separate instances
-                        print(f"  {hand_name.capitalize()}: Skipping interpolation for frames {gap_start}-{gap_end-1} "
+                        logger.debug(f"{hand_name.capitalize()}: Skipping interpolation for frames {gap_start}-{gap_end-1} "
                               f"(distance={center_distance:.1f}px > {max_distance:.1f}px - likely different hand instances)")
                         
                         # Move to the next detection without filling the gap
@@ -878,7 +879,7 @@ def clean_bbox_sequences(raw_data, vis_dir=None):
                     frames_to_fill = min(MAX_PATIENCE_WITHOUT_RETURN, len(raw_data) - gap_start)
                     
                     if frames_to_fill > 0:
-                        print(f"  {hand_name.capitalize()}: Applying static patience for frames {gap_start}-{gap_start + frames_to_fill - 1} "
+                        logger.debug(f"{hand_name.capitalize()}: Applying static patience for frames {gap_start}-{gap_start + frames_to_fill - 1} "
                               f"(hand never reappeared, using last bbox from frame {last_valid_idx})")
                     
                     for j in range(gap_start, gap_start + frames_to_fill):
@@ -904,15 +905,15 @@ def clean_bbox_sequences(raw_data, vis_dir=None):
                 i += 1
     
     if interpolated_count > 0:
-        print(f"  Interpolated {interpolated_count} frames where hand reappeared within patience threshold")
+        logger.info(f"Interpolated {interpolated_count} frames where hand reappeared within patience threshold")
     if patience_applied_count > 0:
-        print(f"  Applied static patience to {patience_applied_count} frames where hand never reappeared")
+        logger.info(f"Applied static patience to {patience_applied_count} frames where hand never reappeared")
     if interpolated_count == 0 and patience_applied_count == 0:
-        print(f"  No patience needed")
+        logger.info(f"No patience needed")
     
     # Remove spurious short motions (brief appearances after long absence)
     # This runs AFTER patience to filter out hallucinations that patience might have extended
-    print("\nRemoving spurious short motions")
+    logger.info("Removing spurious short motions")
     MIN_MOTION_DURATION = 30  # Motion must last at least this many frames
     MIN_ABSENCE_BEFORE = 30   # Must be absent for this long before
     MIN_ABSENCE_AFTER = 30    # Must be absent for this long after
@@ -956,7 +957,7 @@ def clean_bbox_sequences(raw_data, vis_dir=None):
                 absence_before >= MIN_ABSENCE_BEFORE and 
                 absence_after >= MIN_ABSENCE_AFTER):
                 
-                print(f"  {hand_name.capitalize()}: Removing spurious short motion at frames {seg_start}-{seg_end} "
+                logger.debug(f"{hand_name.capitalize()}: Removing spurious short motion at frames {seg_start}-{seg_end} "
                       f"(duration={seg_duration}, absence_before={absence_before}, absence_after={absence_after})")
                 
                 # Remove this segment
@@ -968,19 +969,19 @@ def clean_bbox_sequences(raw_data, vis_dir=None):
                 removed_segments.append((seg_start, seg_end))
         
         if len(removed_segments) > 0:
-            print(f"  {hand_name.capitalize()}: Removed {len(removed_segments)} spurious short motion segments")
+            logger.info(f"{hand_name.capitalize()}: Removed {len(removed_segments)} spurious short motion segments")
         else:
-            print(f"  {hand_name.capitalize()}: No spurious short motions found")
+            logger.info(f"{hand_name.capitalize()}: No spurious short motions found")
 
     # Re-check for overlaps after patience mechanism
-    print("\nRe-checking overlaps after interpolation")
+    logger.info("Re-checking overlaps after interpolation")
     raw_data = detect_overlapping_bboxes(raw_data, iou_threshold=0.7)
 
     # Restore hands that were removed due to overlap, but ONLY if the "winner" hand was
     # subsequently invalidated by other checks (handedness consistency).
     # Logic: If LEFT was removed because RIGHT had higher confidence, but then RIGHT itself
     # was removed by handedness check, we should restore LEFT since it was the original detection.
-    print("\nRestoring hands removed by overlap if winner was invalidated")
+    logger.info("Restoring hands removed by overlap if winner was invalidated")
     restored_count = 0
     for i, (frame_data, orig) in enumerate(zip(raw_data, original_data)):
         for hand_name in ['left', 'right']:
@@ -997,7 +998,7 @@ def clean_bbox_sequences(raw_data, vis_dir=None):
                 
                 # Check if the "winner" hand was subsequently removed by handedness check
                 if frame_data.get(other_handedness_flag, False):
-                    print(f"  Frame {i}: Restoring {hand_name} hand (winner '{other_hand}' was invalidated)")
+                    logger.debug(f"Frame {i}: Restoring {hand_name} hand (winner '{other_hand}' was invalidated)")
                     # Restore original keypoints and confidence
                     if orig[keyp_key] is not None:
                         frame_data[bbox_key] = orig[bbox_key].copy()
@@ -1016,9 +1017,9 @@ def clean_bbox_sequences(raw_data, vis_dir=None):
     raw_data = fix_handedness_swaps_frame_to_frame(raw_data, iou_threshold=0.6)
 
     if restored_count > 0:
-        print(f"  Restored {restored_count} hand instances")
+        logger.info(f"Restored {restored_count} hand instances")
     else:
-        print(f"  No hands needed restoration")
+        logger.info(f"No hands needed restoration")
 
     # Visualize before/after comparison
     visualize_bbox_cleaning(raw_data, original_data, vis_dir)
@@ -1032,9 +1033,9 @@ def clean_bbox_sequences(raw_data, vis_dir=None):
         # Plot bbox trajectories to visualize handedness consistency
         plot_bbox_trajectories(raw_data, vis_dir, filename='bbox_trajectories_after_cleaning.png')
     
-    print("\n" + "="*80)
-    print("PASS 2 Complete: Bbox sequences cleaned")
-    print("="*80)
+    logger.info("="*80)
+    logger.info("PASS 2 Complete: Bbox sequences cleaned")
+    logger.info("="*80)
     
     return raw_data
 
@@ -1054,9 +1055,9 @@ def convert_crop_coords_to_orig_img(bbox, keypoints, crop_size):
 
 def run_hamer_on_cleaned_bboxes(raw_data, model, model_cfg, renderer, args):
     """Pass 3: Run HaMeR on cleaned bboxes."""
-    print("\n" + "="*80)
-    print("PASS 3: Running HaMeR on cleaned bboxes")
-    print("="*80)
+    logger.info("="*80)
+    logger.info("PASS 3: Running HaMeR on cleaned bboxes")
+    logger.info("="*80)
     
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     results_dict = {}
@@ -1245,9 +1246,9 @@ def run_hamer_on_cleaned_bboxes(raw_data, model, model_cfg, renderer, args):
         video_path = os.path.join(os.path.dirname(args.res_folder), f'render_all_{model_cfg.EXTRA.FOCAL_LENGTH}.mp4')
         create_video_from_images(render_path, video_path, fps=30)
     
-    print("\n" + "="*80)
-    print("PASS 3 Complete: HaMeR reconstruction finished")
-    print("="*80)
+    logger.info("="*80)
+    logger.info("PASS 3 Complete: HaMeR reconstruction finished")
+    logger.info("="*80)
     
     return results_dict
 
@@ -1303,10 +1304,10 @@ def main():
     # Get all images matching file_type patterns
     img_paths = sorted([img for end in args.file_type for img in img_folder.glob(end)])
 
-    print(f"Found {len(img_paths)} images in {img_folder}")
+    logger.info(f"Found {len(img_paths)} images in {img_folder}")
 
     # Load models
-    print("\nLoading models...")
+    logger.info("Loading models...")
     download_models(args.data_dir)
     model, model_cfg = load_hamer(args.data_dir)
     model = model.to(device)
@@ -1314,7 +1315,7 @@ def main():
     
     # Load YOLO hand detector (like WiLoR)
     yolo_model_path = os.path.join(args.data_dir, 'pretrained_models', 'detector.pt')
-    print(f"\nLoading YOLO hand detector: {yolo_model_path}")
+    logger.info(f"Loading YOLO hand detector: {yolo_model_path}")
     # Monkey patch torch.load to disable weights_only for YOLO model loading (PyTorch 2.6+ compatibility)
     # The detector.pt is a trusted model file
     import torch as torch_module
@@ -1338,7 +1339,7 @@ def main():
     if args.render and args.res_folder is not None:
         vis_dir = os.path.join(os.path.dirname(args.res_folder), f'bbox_vis_{model_cfg.EXTRA.FOCAL_LENGTH}')
         os.makedirs(vis_dir, exist_ok=True)
-        print(f"\nBbox visualizations will be saved to: {vis_dir}")
+        logger.info(f"Bbox visualizations will be saved to: {vis_dir}")
     
     # PASS 1: Extract raw bboxes using YOLO
     raw_data = extract_raw_bboxes(img_paths, yolo_detector, vis_dir=vis_dir)
@@ -1355,7 +1356,7 @@ def main():
     with open(output_path, 'wb') as f:
         pickle.dump(results, f)
     
-    print(f"\nResults saved to {output_path}")
+    logger.info(f"Results saved to {output_path}")
 
 if __name__ == '__main__':
     main()
